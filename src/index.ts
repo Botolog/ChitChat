@@ -252,6 +252,12 @@ async function main() {
       settingsBox.width = width
       settingsBox.height = height
     }
+
+    // Update QR modal dimensions
+    if (qrModalOverlay) {
+      qrModalOverlay.width = width
+      qrModalOverlay.height = height
+    }
     
     // Re-render based on current view
     if (currentView === "main_menu") {
@@ -878,6 +884,83 @@ async function main() {
     logger.info("App", "Hiding confirmation modal")
   }
 
+  // ========== QR CODE MODAL (WhatsApp authentication) ==========
+  // Rendered inside the TUI because OpenTUI owns the terminal: a QR printed to
+  // stdout by the service is overwritten by the renderer and never seen.
+  const qrModalOverlay = new BoxRenderable(renderer, {
+    id: "qr-modal-overlay",
+    width: width,
+    height: height,
+    backgroundColor: "#0D1117",
+    flexDirection: "column",
+    alignItems: "center",
+    justifyContent: "center",
+    visible: false,
+  })
+
+  const qrModalTitle = new TextRenderable(renderer, {
+    id: "qr-modal-title",
+    content: "📱 Scan this QR code with WhatsApp",
+    fg: colors.primary,
+  })
+
+  const qrModalHint = new TextRenderable(renderer, {
+    id: "qr-modal-hint",
+    content: "WhatsApp → Settings → Linked devices → Link a device",
+    fg: "#8B949E",
+  })
+
+  const qrModalCode = new TextRenderable(renderer, {
+    id: "qr-modal-code",
+    content: "",
+    fg: "#FFFFFF",
+  })
+
+  const qrModalFooter = new TextRenderable(renderer, {
+    id: "qr-modal-footer",
+    content: "",
+    fg: "#6E7681",
+  })
+
+  qrModalOverlay.add(qrModalTitle)
+  qrModalOverlay.add(qrModalHint)
+  qrModalOverlay.add(qrModalCode)
+  qrModalOverlay.add(qrModalFooter)
+  renderer.root.add(qrModalOverlay)
+
+  let qrModalVisible = false
+  let qrModalPrevMainBoxVisible = false
+  let qrModalPrevMenuBoxVisible = false
+
+  function showQrModal(qrText: string) {
+    qrModalTitle.content = "📱 Scan this QR code with WhatsApp"
+    qrModalHint.content = "WhatsApp → Settings → Linked devices → Link a device"
+    qrModalCode.content = qrText
+    qrModalFooter.content = "Waiting for you to scan… (Esc to hide)"
+
+    // Remember what was visible, then take over the screen.
+    qrModalPrevMainBoxVisible = mainBox.visible
+    qrModalPrevMenuBoxVisible = menuBox.visible
+    mainBox.visible = false
+    menuBox.visible = false
+    settingsBox.visible = false
+
+    qrModalVisible = true
+    qrModalOverlay.visible = true
+    logger.info("App", "Showing QR modal", { lines: qrText.split("\n").length })
+  }
+
+  function hideQrModal() {
+    if (!qrModalVisible) return
+    qrModalVisible = false
+    qrModalOverlay.visible = false
+
+    // Restore the previous view.
+    mainBox.visible = qrModalPrevMainBoxVisible
+    menuBox.visible = qrModalPrevMenuBoxVisible
+    logger.info("App", "Hiding QR modal")
+  }
+
   // Define view switching functions now that UI components exist
   showMainMenu = () => {
     mainBox.visible = false
@@ -980,22 +1063,30 @@ async function main() {
     activeService.removeAllListeners()
     
     activeService.on("qr", (qr: string) => {
-      logger.event("App", "qr received")
+      logger.event("App", "qr received", { length: qr.length })
       statusText.content = "○ Scan QR..."
-      loadingText.content = "Scan QR code\nin terminal"
-      if (activeService.displayQrCode) {
-        activeService.displayQrCode(qr)
+      loadingText.content = "Scan QR code\n(shown in the popup)"
+
+      // Render the QR *inside* the TUI (modal) instead of printing to stdout,
+      // which the renderer overwrites immediately.
+      const qrText = activeService.renderQrCode ? activeService.renderQrCode(qr) : ""
+      if (qrText) {
+        showQrModal(qrText)
+      } else {
+        logger.warn("App", "Service did not render a QR code")
       }
     })
 
     activeService.on("authenticated", () => {
       logger.event("App", "authenticated")
+      hideQrModal()
       statusText.content = "○ Authenticated..."
       loadingText.content = "Loading..."
     })
 
     activeService.on("ready", async () => {
       logger.event("App", "ready - service is ready!")
+      hideQrModal()
       isReady = true
       statusText.content = "○ Loading chats..."
       
@@ -1033,6 +1124,7 @@ async function main() {
 
     activeService.on("disconnected", (reason: string) => {
       logger.event("App", "disconnected", { reason })
+      hideQrModal()
       isReady = false
       statusText.content = `✗ ${reason}`
       statusText.fg = "#F15C6D"
@@ -1861,7 +1953,15 @@ async function main() {
       // Ignore all other keys when modal is visible
       return
     }
-    
+
+    // QR modal: Esc hides it. whatsapp-web.js re-emits "qr" periodically, so
+    // the modal comes back on the next emission.
+    if (qrModalVisible && key.name === "escape") {
+      hideQrModal()
+      logger.info("App", "QR modal hidden by user")
+      return
+    }
+
     // CRITICAL: UP from input switches to message selection mode
     if (focusArea === "input" && key.name === "up" && messages.length > 0) {
       // Switch to message selection mode with cursor on last message

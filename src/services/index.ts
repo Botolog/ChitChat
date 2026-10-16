@@ -21,7 +21,12 @@ export interface MessagingService extends EventEmitter {
   getContactInfo(contactId: string): Promise<ContactData | null>
   destroy(): Promise<void>
   getConnectionState(): { ready: boolean; hasQr: boolean }
-  displayQrCode?(qr: string): void
+  /**
+   * Render a QR payload into a printable string (block characters) for the TUI
+   * to display itself. Implementations must NOT write to stdout: the TUI owns
+   * the terminal, so anything printed there is overwritten and never seen.
+   */
+  renderQrCode?(qr: string): string
 }
 
 // Service instances cache

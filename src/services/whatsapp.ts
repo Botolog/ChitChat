@@ -287,8 +287,19 @@ class WhatsAppService extends EventEmitter {
     return this.qrCode
   }
 
-  displayQrCode(qr: string) {
-    qrcode.generate(qr, { small: true })
+  /**
+   * Render a QR payload into a printable string of block characters.
+   *
+   * Returned rather than printed on purpose: the TUI owns the terminal, so
+   * writing to stdout here is invisible/overwritten (this is why the QR never
+   * showed up). The UI layer draws the returned string inside a modal.
+   */
+  renderQrCode(qr: string): string {
+    let rendered = ""
+    qrcode.generate(qr, { small: true }, (out: string) => {
+      rendered = out
+    })
+    return rendered
   }
 
   async getChats(): Promise<ChatData[]> {
