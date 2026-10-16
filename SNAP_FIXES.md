@@ -1,203 +1,180 @@
-# Snap Sandboxing and CWD Fixes
+# Snap Packaging Notes
 
-## Issues Identified
+This document explains how ChitChat runs inside its snap and, in particular,
+how the bundled Chromium used by WhatsApp (via `whatsapp-web.js` → Puppeteer)
+is shipped.
 
-### 1. Working Directory Problem
-**Problem**: The wrapper script was changing to `$SNAP/app` which is read-only, causing all file write operations to fail.
+## Why WhatsApp failed to start
 
-**Root Cause**: Your application uses `process.cwd()` in multiple places to write data files:
-- `.media-cache/` - Media file cache
-- `.chitchat-settings.json` - Application settings
-- `.slack-tokens.json` - Slack authentication tokens
-- `*.log` files - Log files (chitchat.log, whatsapp.log, slack.log)
-- `.wwebjs_auth/` - WhatsApp authentication data (created by whatsapp-web.js LocalAuth)
+`whatsapp-web.js` drives a real Chromium through Puppeteer. Puppeteer refuses
+to launch unless it can find the **exact** Chrome build that the installed
+`puppeteer`/`puppeteer-core` version expects (see
+`node_modules/puppeteer-core/lib/cjs/puppeteer/revisions.js`). For the
+`puppeteer` version currently pinned by `whatsapp-web.js` that revision is
+Chrome **144.0.7559.96**.
 
-### 2. Missing Browser Support
-**Problem**: Puppeteer (used by whatsapp-web.js) needs Chromium and proper permissions to run headless browser.
+The previous snap packaging had three problems:
 
-### 3. Incomplete Sandboxing
-**Problem**: Missing proper interfaces and environment configuration for a fully sandboxed snap.
+1. **The browser was never actually shipped.**
+   The `chitchat` part downloaded Chromium into
+   `$CRAFT_PART_INSTALL/chromium/`, but the part also declared
 
-## Changes Made
+   ```yaml
+   stage:
+     - app/
+   ```
 
-### 1. Fixed Wrapper Script (`snapcraft.yaml` lines 76-84)
-**Before**:
-```bash
-cd "$SNAP/app"
-exec "$SNAP/.bun/bin/bun" run src/index.ts "$@"
+   `stage` is a *whitelist* applied to the part's whole install directory: when
+   it is set, only the listed paths are copied into the final snap. Because
+   `chromium/` (and, in fact, every library from `stage-packages`, which also
+   live in the install directory) was not listed, it was silently dropped, so
+   `$SNAP/chromium/chrome-linux/chrome` did not exist at runtime. The fix is to
+   **not set `stage` on this part at all** — then everything in
+   `$CRAFT_PART_INSTALL` is staged.
+
+2. **The bundled revision did not match Puppeteer.**
+   The build hard-coded Chromium `131.0.6778.204`, while the installed
+   Puppeteer expects `144.0.7559.96`. This is what produced the
+   `Could not find Chrome (ver. 144...)` message.
+
+3. **Obsolete environment variables / paths.**
+   `PUPPETEER_SKIP_CHROMIUM_DOWNLOAD` was removed from Puppeteer in v22 (the
+   current name is `PUPPETEER_SKIP_DOWNLOAD`), and
+   `PUPPETEER_EXECUTABLE_PATH` pointed at a `$SNAP/...` path that was never
+   shipped. A stale `PUPPETEER_EXECUTABLE_PATH` makes launch fail before
+   Puppeteer ever looks at its cache.
+
+## Passing the release pipeline
+
+Two properties are required for the `release.yml` pipeline to publish
+successfully (it targets the `stable` channel by default):
+
+- **`grade: stable` and `confinement: strict`.** The Snap Store rejects
+  `devmode`/`devel` revisions from the `stable` and `candidate` channels (they
+  may only go to `edge`/`beta`). Bundling Chrome and using the
+  `browser-support` plug means strict confinement is sufficient, so there is no
+  reason to ship a `devmode` snap.
+- **`command: bin/chitchat`.** `apps.<name>.command` is validated by Snapcraft
+  and may only contain alphanumerics, spaces and `/ . _ # : $ -`. A shell
+  invocation such as
+  `bin/sh -c 'cd $SNAP_USER_COMMON && exec $SNAP/.bun/bin/bun ... "$@"'`
+  therefore fails project validation before the build even starts. Because the
+  command string cannot contain quotes, redirections or `"$@"`, the module is
+  launched through a small wrapper script (`bin/chitchat`, created in
+  `override-build`) that *can* contain them.
+
+The wrapper lives inside the snap and is executed directly by
+`snap run chitchat`, so arguments (`chitchat --demo`) are forwarded verbatim.
+
+## How the browser is shipped now
+
+During the build we let Puppeteer install its own browser into the snap:
+
+```sh
+export PUPPETEER_CACHE_DIR="$CRAFT_PART_INSTALL/puppeteer-browsers"
+export PUPPETEER_SKIP_CHROME_HEADLESS_SHELL_DOWNLOAD=true   # we only need full Chrome
+bun node_modules/puppeteer/install.mjs
 ```
 
-**After**:
-```bash
-# Ensure writable data directory exists
-mkdir -p "$SNAP_USER_COMMON"
-# Change to writable directory so process.cwd() points to writable location
-cd "$SNAP_USER_COMMON"
-# Run from snap app directory but with CWD in writable location
-exec "$SNAP/.bun/bin/bun" run "$SNAP/app/src/index.ts" "$@"
-```
+Because the installer reads the revision from the installed package, the
+browser and Puppeteer can never drift apart again. The build then *verifies*
+that a `chrome` binary exists and fails loudly if it does not.
 
-**Result**: Now `process.cwd()` returns `$SNAP_USER_COMMON` (typically `~/snap/chitchat/common/`), which is writable.
+At runtime the app points Puppeteer at that read-only cache and disables
+downloads:
 
-### 2. Added Environment Variables
 ```yaml
 environment:
   HOME: $SNAP_USER_COMMON
   TMPDIR: $SNAP_USER_COMMON/tmp
+  PUPPETEER_TMP_DIR: $SNAP_USER_COMMON/tmp
   CHITCHAT_DATA_DIR: $SNAP_USER_COMMON
   NODE_PATH: $SNAP/app/node_modules
-  PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: "true"
-  PUPPETEER_EXECUTABLE_PATH: $SNAP/usr/bin/chromium-browser
+  PUPPETEER_CACHE_DIR: $SNAP/puppeteer-browsers
+  PUPPETEER_SKIP_DOWNLOAD: "true"
 ```
 
-- `CHITCHAT_DATA_DIR`: Available for future use if you want to make code more snap-aware
-- `NODE_PATH`: Ensures node_modules are found when running from different directory
-- `PUPPETEER_*`: Configures Puppeteer to use bundled Chromium instead of downloading
+`PUPPETEER_CACHE_DIR` is honored by Puppeteer's path resolution, so no
+`PUPPETEER_EXECUTABLE_PATH` is needed. If one *is* set from the outside, the
+application ignores it when the file does not exist (see
+`resolveExecutablePath()` in `src/services/whatsapp.ts`).
 
-### 3. Added Browser Support Interface
-```yaml
-plugs:
-  - network
-  - network-bind
-  - home
-  - browser-support  # NEW: Required for Chromium/Puppeteer
-```
+## Writable working directory
 
-### 4. Added System Libraries for Chromium
-Since chromium-browser is distributed as a snap in Ubuntu 22.04 (not available in core22 repos), we let Puppeteer download its own Chromium but provide required system libraries:
+The launcher wrapper (`bin/chitchat`) creates the writable scratch dirs and
+runs the app from `$SNAP_USER_COMMON`, because the app writes relative to
+`process.cwd()`:
 
-```yaml
-stage-packages:
-  - ca-certificates
-  - fonts-liberation
-  - libasound2
-  - libatk-bridge2.0-0
-  - libatk1.0-0
-  - libatspi2.0-0
-  - libc6
-  - libcairo2
-  - libcups2
-  - libdbus-1-3
-  - libdrm2
-  - libexpat1
-  - libgbm1
-  - libglib2.0-0
-  - libnspr4
-  - libnss3
-  - libpango-1.0-0
-  - libx11-6
-  - libxcb1
-  - libxcomposite1
-  - libxdamage1
-  - libxext6
-  - libxfixes3
-  - libxkbcommon0
-  - libxrandr2
-```
+- `.wwebjs_auth/` – WhatsApp session (`LocalAuth`)
+- `.media-cache/` – downloaded media
+- `.chitchat-settings.json`, `.chitchat-keybindings.json`
+- `.slack-tokens.json`
+- `chitchat.log`, `whatsapp.log`, `slack.log`
 
-## Directory Structure After Install
+`$SNAP` is read-only (squashfs), which is why the app must not run from there.
+
+## Directory layout after install
 
 ```
-$SNAP/                           # Read-only snap directory
+$SNAP/                              # read-only
 ├── app/
-│   ├── src/                     # Your TypeScript source
-│   └── node_modules/            # Dependencies
-└── usr/bin/chromium-browser     # Bundled Chromium
+│   ├── src/
+│   └── node_modules/
+├── bin/chitchat                    # launcher wrapper
+├── .bun/bin/bun
+└── puppeteer-browsers/             # bundled Chrome (exact Puppeteer revision)
+    └── chrome/linux-<ver>/chrome-linux64/chrome
 
-$SNAP_USER_COMMON/               # Writable data directory (CWD)
-├── .media-cache/                # Media files
-├── .chitchat-settings.json      # Settings
-├── .slack-tokens.json           # Slack tokens
-├── .wwebjs_auth/                # WhatsApp auth data
-├── chitchat.log                 # Logs
-├── whatsapp.log
-└── slack.log
+$SNAP_USER_COMMON/                  # writable (CWD)
+├── tmp/
+├── .wwebjs_auth/
+├── .media-cache/
+├── .chitchat-settings.json
+└── *.log
 ```
 
-## How It Works Now
+## Debugging a launch failure
 
-1. **Snap starts** → Wrapper script runs
-2. **CWD changes to** `$SNAP_USER_COMMON` (e.g., `~/snap/chitchat/common/`)
-3. **Bun executes** `$SNAP/app/src/index.ts` from the read-only directory
-4. **All file operations** via `process.cwd()` write to the writable `$SNAP_USER_COMMON`
-5. **WhatsApp LocalAuth** creates `.wwebjs_auth/` in the writable directory
-6. **Puppeteer/Chromium** runs with proper sandbox permissions via `browser-support` interface
+If WhatsApp still fails to initialize:
 
-## Testing Steps
+1. Restart the app with Chromium logging enabled (the app reads the env var at
+   startup):
 
-1. **Clean build**:
-   ```bash
-   snapcraft clean
-   snapcraft --use-lxd
+   ```sh
+   CHITCHAT_PUPPETEER_DUMPIO=1 chitchat
    ```
 
-2. **Install the snap**:
-   ```bash
-   sudo snap install ./chitchat_*.snap --dangerous
+   Chromium's stdout/stderr will be piped into the app output. (Snap apps
+   inherit the caller's environment, but `export CHITCHAT_PUPPETEER_DUMPIO=1`
+   before `chitchat` is the reliable form.)
+
+2. Inspect `~/snap/chitchat/common/whatsapp.log`. The logger now serializes
+   plain-object errors instead of printing `[object Object]`.
+
+3. Verify that Chrome is present inside the snap and that it starts:
+
+   ```sh
+   snap run --shell chitchat
+   find "$SNAP/puppeteer-browsers" -name chrome
+   "$SNAP/puppeteer-browsers"/chrome/*/chrome-linux64/chrome --version
    ```
 
-3. **Run the snap**:
-   ```bash
-   chitchat
-   ```
-   **Note**: First run will download Chromium (~150MB) - this may take a minute.
+   If `chrome --version` reports missing shared libraries, add the
+   corresponding package to `stage-packages` in `snapcraft.yaml`.
 
-4. **Verify data directory**:
-   ```bash
-   ls -la ~/snap/chitchat/common/
-   ```
-   You should see:
-   - `.media-cache/` directory
-   - `.chitchat-settings.json` file (after changing settings)
-   - `.wwebjs_auth/` directory (after WhatsApp login)
-   - Log files
+4. Confirm the interfaces are connected:
 
-5. **Check logs for errors**:
-   ```bash
-   cat ~/snap/chitchat/common/chitchat.log
+   ```sh
+   snap connections chitchat
    ```
 
-## Snap Confinement Details
-
-- **Confinement**: `strict` - Full sandboxing enabled
-- **Grade**: `stable` - Production-ready
-- **Base**: `core22` - Ubuntu 22.04 LTS
-
-### Interfaces Connected
-- `network` - Outbound network access (WhatsApp, Slack APIs)
-- `network-bind` - Listen on network ports (if needed)
-- `home` - Read/write to user home directory
-- `browser-support` - Run Chromium with required permissions
-
-## Future Improvements (Optional)
-
-If you want to make the code more snap-aware, you could:
-
-1. **Use CHITCHAT_DATA_DIR environment variable**:
-   ```typescript
-   const DATA_DIR = process.env.CHITCHAT_DATA_DIR || process.cwd()
-   const SETTINGS_FILE = join(DATA_DIR, ".chitchat-settings.json")
-   ```
-
-2. **Detect snap environment**:
-   ```typescript
-   const isSnap = process.env.SNAP !== undefined
-   ```
-
-3. **Add personal-files interface** (if you need access to specific hidden directories in home):
-   ```yaml
-   plugs:
-     dot-config-chitchat:
-       interface: personal-files
-       write:
-         - $HOME/.config/chitchat
-   ```
-
-However, these are **not necessary** - the current configuration works correctly as-is!
+   `browser-support` must be connected for Chromium to create its sandbox
+   (the app also passes `--no-sandbox`, which is normal inside a snap).
 
 ## References
 
-Based on Snapcraft best practices from:
-- https://documentation.ubuntu.com/snapcraft/stable/tutorials/craft-a-snap/
+- Puppeteer configuration: https://pptr.dev/guides/configuration
+- Puppeteer browser management: https://pptr.dev/guides/browser-management
+- Snapcraft `parts.<part>.stage`: https://snapcraft.io/docs/snapcraft-yaml
 - Snap environment variables: https://snapcraft.io/docs/environment-variables
-- Interfaces documentation: https://snapcraft.io/docs/interface-management
+- Snap interfaces: https://snapcraft.io/docs/interface-management

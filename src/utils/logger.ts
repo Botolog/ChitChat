@@ -41,10 +41,34 @@ export class Logger {
   error(context: string, message: string, error?: any) {
     let errorData: any = undefined
     if (error) {
-      errorData = {
-        message: error.message || String(error),
-        stack: error.stack,
-        name: error.name,
+      if (error instanceof Error) {
+        errorData = {
+          message: error.message,
+          stack: error.stack,
+          name: error.name,
+        }
+      } else if (typeof error === "object") {
+        // Puppeteer/whatsapp-web.js sometimes throw plain objects, and callers
+        // sometimes wrap an Error in a metadata object. JSON stringify with a
+        // replacer so the real content is visible in the log instead of the
+        // useless "[object Object]".
+        let serialized: any
+        try {
+          serialized = JSON.parse(
+            JSON.stringify(error, (_key, value) =>
+              value instanceof Error
+                ? { name: value.name, message: value.message, stack: value.stack }
+                : value
+            )
+          )
+        } catch {
+          serialized = String(error)
+        }
+        errorData = (error as any).message !== undefined
+          ? { message: (error as any).message, name: (error as any).name }
+          : serialized
+      } else {
+        errorData = { message: String(error) }
       }
     }
     const line = formatMessage("ERROR", context, message, errorData)

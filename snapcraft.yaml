@@ -20,8 +20,12 @@ website: https://github.com/Botolog/ChitChat
 issues: https://github.com/Botolog/ChitChat/issues
 source-code: https://github.com/Botolog/ChitChat
 
-confinement: devmode
-grade: devel
+# The Snap Store only accepts releases to `stable`/`candidate` for strict
+# snaps with the `stable` grade. devmode/devel can only go to edge/beta, so the
+# release pipeline (which targets `stable` by default) would be rejected.
+# Bundling Chromium + the `browser-support` plug means strict confinement works.
+confinement: strict
+grade: stable
 
 architectures:
   - build-on: amd64
@@ -29,7 +33,7 @@ architectures:
 
 apps:
   chitchat:
-    command: bin/sh -c 'cd $SNAP_USER_COMMON && exec $SNAP/.bun/bin/bun run $SNAP/app/src/index.ts "$@"'
+    command: bin/chitchat
     plugs:
       - network
       - network-bind
@@ -38,12 +42,15 @@ apps:
     environment:
       HOME: $SNAP_USER_COMMON
       TMPDIR: $SNAP_USER_COMMON/tmp
+      PUPPETEER_TMP_DIR: $SNAP_USER_COMMON/tmp
       CHITCHAT_DATA_DIR: $SNAP_USER_COMMON
       NODE_PATH: $SNAP/app/node_modules
-      PUPPETEER_CACHE_DIR: $SNAP_USER_COMMON/.cache/puppeteer
-      PUPPETEER_SKIP_CHROMIUM_DOWNLOAD: "true"
-      PUPPETEER_EXECUTABLE_PATH: $SNAP/chromium/chrome-linux/chrome
-      LD_LIBRARY_PATH: $SNAP/usr/lib/x86_64-linux-gnu:$SNAP/lib/x86_64-linux-gnu:$SNAP/usr/lib:$SNAP/lib:$LD_LIBRARY_PATH
+      # The browser is bundled at build time into the snap (read-only).
+      # Point Puppeteer's cache at it so it resolves the exact revision the
+      # installed puppeteer version expects, and never try to download.
+      PUPPETEER_CACHE_DIR: $SNAP/puppeteer-browsers
+      PUPPETEER_SKIP_DOWNLOAD: "true"
+      LD_LIBRARY_PATH: $SNAP/usr/lib/x86_64-linux-gnu:$SNAP/usr/lib/aarch64-linux-gnu:$SNAP/usr/lib:$SNAP/lib/x86_64-linux-gnu:$SNAP/lib/aarch64-linux-gnu:$SNAP/lib:$LD_LIBRARY_PATH
 
 parts:
   bun:
@@ -64,7 +71,6 @@ parts:
     after: [bun]
     build-attributes:
       - enable-patchelf
-      - no-linter
     build-packages:
       - curl
       - git
@@ -81,6 +87,7 @@ parts:
       - libavahi-common3
       - libc6
       - libcairo2
+      - libcairo-gobject2
       - libcups2
       - libdatrie1
       - libdbus-1-3
@@ -95,13 +102,18 @@ parts:
       - libnspr4
       - libnss3
       - libpango-1.0-0
+      - libpangocairo-1.0-0
       - libpixman-1-0
       - libthai0
       - libx11-6
+      - libx11-xcb1
       - libxau6
       - libxcb1
+      - libxcb-dri3-0
+      - libxcb-present0
       - libxcb-render0
       - libxcb-shm0
+      - libxcb-sync1
       - libxcomposite1
       - libxdamage1
       - libxdmcp6
@@ -112,46 +124,74 @@ parts:
       - libxrandr2
       - libxrender1
       - libxshmfence1
+      - libxss1
+      - libxtst6
     override-build: |
+      # Work from the pulled source tree so that `bun install` and the
+      # Puppeteer installer see the same node_modules that gets copied below.
+      cd "$CRAFT_PART_SRC"
+
       # Set up Bun in PATH
       export PATH="$CRAFT_STAGE/.bun/bin:$PATH"
-      
-      # Install dependencies
-      bun install --frozen-lockfile
-      
-      # Download Chromium for Puppeteer
-      echo "Downloading Chromium for Puppeteer..."
-      CHROMIUM_VERSION="131.0.6778.204"
-      CHROMIUM_URL="https://storage.googleapis.com/chromium-browser-snapshots/Linux_x64/1368524/chrome-linux.zip"
-      
-      mkdir -p $CRAFT_PART_INSTALL/chromium
-      curl -L -o /tmp/chromium.zip "$CHROMIUM_URL"
-      unzip -q /tmp/chromium.zip -d $CRAFT_PART_INSTALL/chromium
-      
-      # Make chrome executable
-      chmod +x $CRAFT_PART_INSTALL/chromium/chrome-linux/chrome
-      
-      # Verify chrome binary exists
-      if [ -f "$CRAFT_PART_INSTALL/chromium/chrome-linux/chrome" ]; then
-        echo "Chromium installed successfully at $CRAFT_PART_INSTALL/chromium/chrome-linux/chrome"
-        ls -lh $CRAFT_PART_INSTALL/chromium/chrome-linux/chrome
-      else
-        echo "ERROR: Chromium binary not found!"
+
+      # Install JavaScript dependencies. Prevent `bun install` from triggering
+      # puppeteer's postinstall download (we do it explicitly below, into the
+      # snap's install directory).
+      export PUPPETEER_SKIP_DOWNLOAD=true
+      bun install
+      unset PUPPETEER_SKIP_DOWNLOAD
+
+      # ------------------------------------------------------------------
+      # Bundle the Chromium build that the installed puppeteer expects.
+      #
+      # IMPORTANT: do NOT hardcode a Chromium revision here. whatsapp-web.js
+      # depends on a puppeteer version that expects a *specific* Chrome build
+      # (see node_modules/puppeteer-core/lib/.../revisions.js). If the bundled
+      # browser does not match, puppeteer fails at launch with
+      # "Could not find Chrome (ver. ...)".
+      #
+      # Running puppeteer's own installer reads the revision from the
+      # installed package, so the two always match after `bun install`.
+      # ------------------------------------------------------------------
+      export PUPPETEER_CACHE_DIR="$CRAFT_PART_INSTALL/puppeteer-browsers"
+      mkdir -p "$PUPPETEER_CACHE_DIR"
+      # Skip the unneeded legacy headless shell to keep the snap smaller.
+      export PUPPETEER_SKIP_CHROME_HEADLESS_SHELL_DOWNLOAD=true
+      bun node_modules/puppeteer/install.mjs
+
+      # Fail the build loudly if no browser was actually downloaded.
+      CHROME_BIN="$(find "$PUPPETEER_CACHE_DIR" -type f -name chrome -path '*chrome-linux*' | head -n1)"
+      if [ -z "$CHROME_BIN" ]; then
+        echo "ERROR: Puppeteer did not download a Chrome binary into $PUPPETEER_CACHE_DIR"
+        find "$PUPPETEER_CACHE_DIR" -maxdepth 4 -ls || true
         exit 1
       fi
-      
-      # Verify libnss3 is staged
-      echo "Checking for libnss3.so..."
-      find $CRAFT_PART_INSTALL -name "libnss3.so*" -ls || echo "WARNING: libnss3.so not found in staged files"
-      
-      rm /tmp/chromium.zip
-      
+      chmod +x "$CHROME_BIN"
+      echo "Bundled Chrome: $CHROME_BIN"
+
       # Copy source files and node_modules to app directory
       mkdir -p $CRAFT_PART_INSTALL/app
       cp -r $CRAFT_PART_SRC/src $CRAFT_PART_INSTALL/app/
       cp -r $CRAFT_PART_SRC/node_modules $CRAFT_PART_INSTALL/app/
       cp $CRAFT_PART_SRC/package.json $CRAFT_PART_INSTALL/app/ || echo "Warning: package.json not copied"
 
-    stage:
-      - app/
-      - bin/chitchat
+      # Create the launcher wrapper. The Chromium/Puppeteer sandbox needs a
+      # writable HOME/tmp and the app writes settings/logs/media relative to
+      # the current working directory, so run everything from
+      # $SNAP_USER_COMMON (writable) instead of the read-only $SNAP.
+      mkdir -p $CRAFT_PART_INSTALL/bin
+      cat > $CRAFT_PART_INSTALL/bin/chitchat << 'EOF'
+      #!/bin/sh
+      set -e
+      mkdir -p "$SNAP_USER_COMMON/tmp" "$SNAP_USER_COMMON/.cache/puppeteer"
+      cd "$SNAP_USER_COMMON"
+      exec "$SNAP/.bun/bin/bun" run "$SNAP/app/src/index.ts" "$@"
+      EOF
+      chmod +x $CRAFT_PART_INSTALL/bin/chitchat
+
+    # NOTE: do *not* add a `stage:` key to this part. `stage` is a whitelist
+    # applied to the part's whole install directory, so listing anything here
+    # would silently drop the bundled browser (`puppeteer-browsers/`) and every
+    # library brought in by `stage-packages`. Leaving it unset stages all of
+    # `$CRAFT_PART_INSTALL`.
+

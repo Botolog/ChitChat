@@ -2,10 +2,65 @@ import pkg from "whatsapp-web.js"
 const { Client, LocalAuth } = pkg
 import qrcode from "qrcode-terminal"
 import { EventEmitter } from "events"
+import { existsSync } from "fs"
 import { Logger } from "../utils/logger"
 import { mediaCache } from "../utils/mediaCache"
 
 const logger = new Logger("whatsapp.log", "WhatsApp")
+
+/**
+ * Resolve the Chromium executable Puppeteer should use.
+ *
+ * Puppeteer ignores `PUPPETEER_EXECUTABLE_PATH` only when it is unset; if the
+ * variable points at a path that does not exist, launch fails with a
+ * confusing "Browser was not found at the configured executablePath" error.
+ * Snap/package managers frequently leave a stale value behind (or point at
+ * `$SNAP/...` paths that were not shipped), so only honour the variable when
+ * the file is actually present. Otherwise we return `undefined` and let
+ * Puppeteer resolve its bundled browser from PUPPETEER_CACHE_DIR.
+ */
+function resolveExecutablePath(): string | undefined {
+  const configured = process.env.PUPPETEER_EXECUTABLE_PATH
+  if (!configured) return undefined
+  if (existsSync(configured)) return configured
+  logger.warn("WhatsApp", "PUPPETEER_EXECUTABLE_PATH does not exist, ignoring it", {
+    executablePath: configured,
+  })
+  return undefined
+}
+
+/**
+ * Shared Puppeteer launch options. Kept in one place so the initial client and
+ * the reconnect client can never drift apart. Set CHITCHAT_PUPPETEER_DUMPIO=1
+ * to pipe the Chromium process stdout/stderr into the app logs when debugging
+ * launch failures.
+ */
+function buildPuppeteerOptions() {
+  return {
+    headless: true,
+    executablePath: resolveExecutablePath(),
+    dumpio: process.env.CHITCHAT_PUPPETEER_DUMPIO === "1",
+    args: [
+      "--no-sandbox",
+      "--disable-setuid-sandbox",
+      "--disable-dev-shm-usage",
+      "--disable-accelerated-2d-canvas",
+      "--no-first-run",
+      "--no-zygote",
+      "--disable-gpu",
+      "--disable-extensions",
+      "--disable-background-networking",
+      "--disable-default-apps",
+      "--disable-sync",
+      "--disable-translate",
+      "--metrics-recording-only",
+      "--mute-audio",
+      "--safebrowsing-disable-auto-update",
+      "--disable-features=site-per-process",
+    ],
+    timeout: 120000,
+  }
+}
 
 export interface ChatData {
   id: string
@@ -69,36 +124,15 @@ class WhatsAppService extends EventEmitter {
   constructor() {
     super()
     logger.info("WhatsApp", "Creating WhatsApp client")
-    const execPath = process.env.PUPPETEER_EXECUTABLE_PATH || undefined
+    const execPath = resolveExecutablePath()
     logger.info("WhatsApp", "Puppeteer config", { 
       executablePath: execPath,
-      hasEnvVar: !!process.env.PUPPETEER_EXECUTABLE_PATH 
+      hasEnvVar: !!process.env.PUPPETEER_EXECUTABLE_PATH,
+      cacheDir: process.env.PUPPETEER_CACHE_DIR,
     })
     this.client = new Client({
       authStrategy: new LocalAuth(),
-      puppeteer: {
-        headless: true,
-        executablePath: execPath,
-        args: [
-          "--no-sandbox",
-          "--disable-setuid-sandbox",
-          "--disable-dev-shm-usage",
-          "--disable-accelerated-2d-canvas",
-          "--no-first-run",
-          "--no-zygote",
-          "--disable-gpu",
-          "--disable-extensions",
-          "--disable-background-networking",
-          "--disable-default-apps",
-          "--disable-sync",
-          "--disable-translate",
-          "--metrics-recording-only",
-          "--mute-audio",
-          "--safebrowsing-disable-auto-update",
-          "--disable-features=site-per-process",
-        ],
-        timeout: 120000,
-      },
+      puppeteer: buildPuppeteerOptions(),
     })
     logger.info("WhatsApp", "Client created, setting up event handlers")
     this.setupEventHandlers()
@@ -730,29 +764,7 @@ class WhatsAppService extends EventEmitter {
       // Recreate client
       this.client = new Client({
         authStrategy: new LocalAuth(),
-        puppeteer: {
-          headless: true,
-          executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-          args: [
-            "--no-sandbox",
-            "--disable-setuid-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-accelerated-2d-canvas",
-            "--no-first-run",
-            "--no-zygote",
-            "--disable-gpu",
-            "--disable-extensions",
-            "--disable-background-networking",
-            "--disable-default-apps",
-            "--disable-sync",
-            "--disable-translate",
-            "--metrics-recording-only",
-            "--mute-audio",
-            "--safebrowsing-disable-auto-update",
-            "--disable-features=site-per-process",
-          ],
-          timeout: 120000,
-        },
+        puppeteer: buildPuppeteerOptions(),
       })
       
       this.setupEventHandlers()

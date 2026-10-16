@@ -966,8 +966,9 @@ async function main() {
       await activeService.initialize()
       logger.info("App", "Service initialized", { serviceId })
     } catch (err: any) {
-      logger.error("App", "Service initialization failed", { serviceId, error: err.message })
-      statusText.content = `✗ ${err.message?.slice(0, 30) || "Error"}`
+      logger.error("App", "Service initialization failed", { serviceId, error: err })
+      const reason = err instanceof Error ? err.message : (err?.message || String(err))
+      statusText.content = `✗ ${reason?.slice(0, 30) || "Error"}`
       statusText.fg = "#F15C6D"
     }
   }
