@@ -198,7 +198,9 @@ Architecture and conventions are documented in
   [PR #201850](https://github.com/wwebjs/whatsapp-web.js/pull/201850)), so ChitChat
   applies them itself, at runtime, right after the library injects itself into the
   page (`src/utils/whatsappCompat.ts`): message keys get their `_serialized` back
-  and the chat/message mappers fall back to a minimal model instead of throwing.
+  (on the key class itself, since the library's send path looks up the key it has
+  just built by that name) and the chat/message mappers fall back to a minimal
+  model instead of throwing.
 
   The log confirms it once per connection:
 

@@ -257,11 +257,14 @@ WhatsApp field hardening (reported from a real install):
   mapping. ChitChat now installs a small runtime compatibility layer
   (`src/utils/whatsappCompat.ts`) once the library has injected `window.WWebJS`:
   it aliases the renamed message-key field (`$1` → `_serialized`) on the key class
-  and on serialized ids, makes `getMessageModel`/`getChatModel` degrade to a
-  minimal plain model instead of throwing, isolates `getChats` per chat, and adds
-  the `getMsgKeyId` helper the upstream patch introduces. It is version-tolerant —
-  every wrapper tries the original implementation first — and its counters (plus
-  which patches applied) are written into the page-state dump. The service also
+  itself — the library's own send path looks a freshly built key up by that name,
+  so the alias cannot wait for the first key to appear — and on serialized ids,
+  makes `getMessageModel`/`getChatModel` degrade to a minimal plain model instead
+  of throwing, isolates `getChats` per chat, and adds the `getMsgKeyId` helper the
+  upstream patch introduces. It is version-tolerant — every wrapper tries the
+  original implementation first, and a key that still sets `_serialized` itself
+  wins over the alias — and its counters (plus which patches applied) are written
+  into the page-state dump. The service also
   stopped resolving chats for actions that only need an id (`sendSeen`, `pinChat`,
   `muteChat`, `archiveChat`, `getMessageById`) and reads message ids through one
   tolerant helper.

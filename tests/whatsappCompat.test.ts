@@ -127,6 +127,49 @@ describe("installWhatsAppCompat", () => {
     expect(plain.id._serialized).toBe("false_3@s.whatsapp.net_EF")
   })
 
+  test("aliases the key class up front, before any key has been seen", () => {
+    // whatsapp-web.js' own send path builds a key and then looks it up by
+    // `_serialized`, so whether a chat list has been read yet must not matter.
+    class MessageKey {
+      [field: string]: any
+      constructor(serialized: string) {
+        this.$1 = serialized
+      }
+    }
+    const WWebJS: Record<string, any> = { getMessageModel: (m: any) => m }
+    const report = install({ WWebJS, modules: { WAWebMsgKey: MessageKey } })
+
+    expect(report.patches).toContain("messageKey._serialized")
+    const key = new MessageKey("false_9@s.whatsapp.net_ZZ")
+    expect(key._serialized).toBe("false_9@s.whatsapp.net_ZZ")
+
+    // Assignment still works — a setter-less accessor would throw in strict mode.
+    key._serialized = "false_9@s.whatsapp.net_YY"
+    expect(key._serialized).toBe("false_9@s.whatsapp.net_YY")
+  })
+
+  test("leaves a key that sets `_serialized` itself alone", () => {
+    // Builds that never renamed anything assign the field in the constructor; an
+    // own property always wins over the alias, so nothing changes for them.
+    class MessageKey {
+      [field: string]: any
+      constructor(serialized: string) {
+        this._serialized = serialized
+      }
+    }
+    install({
+      WWebJS: { getMessageModel: (m: any) => m },
+      modules: { WAWebMsgKey: MessageKey },
+    })
+
+    const key = new MessageKey("false_1@s.whatsapp.net_AB")
+    expect(key._serialized).toBe("false_1@s.whatsapp.net_AB")
+
+    // Assigning still works (a setter-less accessor would throw in strict mode).
+    key._serialized = "reassigned"
+    expect(key._serialized).toBe("reassigned")
+  })
+
   test("maps a message WhatsApp cannot serialize instead of failing the listing", () => {
     const raw = {
       id: { $1: "false_2@s.whatsapp.net_CD", fromMe: false },

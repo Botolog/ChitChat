@@ -18,8 +18,10 @@
  * #201850) but nothing released, so ChitChat applies them itself, at runtime,
  * after `whatsapp-web.js` has injected `window.WWebJS`:
  *
- * 1. every message key gets its `_serialized` back (a getter aliasing `$1` on
- *    the key class, plus the copy the upstream patch makes on serialized models);
+ * 1. every message key gets its `_serialized` back — the alias goes on the key
+ *    class up front (the library's own send path looks up the key it has just
+ *    built by that name), plus the copy the upstream patch makes on serialized
+ *    models;
  * 2. `getMessageModel` and `getChatModel` never throw — a chat or message that
  *    WhatsApp cannot serialize degrades to a minimal, plain model instead of
  *    taking the whole call with it;
@@ -111,37 +113,59 @@ export function installWhatsAppCompat(): WhatsAppCompatReport {
     }, "")
 
   /**
-   * Restore `_serialized` on a message key.
+   * Give the message-key class its `_serialized` back.
    *
-   * The rename lives on the key class, so new keys are fixed once, on the
-   * prototype — but serialized models hand out plain objects, which need the
-   * property copied onto them individually (exactly what the upstream patch
-   * does). `Object.prototype` is never touched.
+   * The renamed field is an *instance* property, so the alias belongs on the
+   * class prototype — and instances that still set `_serialized` themselves keep
+   * their own value (an own property always wins), which makes this inert on
+   * builds that never renamed anything. `Object.prototype` is never touched.
+   */
+  const aliasKeyPrototype = (proto: any): void => {
+    if (!proto || proto === Object.prototype) return
+    if (Object.prototype.hasOwnProperty.call(proto, "_serialized")) return
+    try {
+      Object.defineProperty(proto, "_serialized", {
+        configurable: true,
+        get(this: any) {
+          return this.$1
+        },
+        // A setter-less accessor would make `key._serialized = …` throw in strict
+        // mode; assigning keeps normal semantics by creating an own property.
+        set(this: any, value: unknown) {
+          Object.defineProperty(this, "_serialized", {
+            configurable: true,
+            writable: true,
+            enumerable: true,
+            value,
+          })
+        },
+      })
+      mark("messageKey._serialized")
+    } catch (err) {
+      note(err)
+    }
+  }
+
+  /**
+   * Restore `_serialized` on one key object.
+   *
+   * Raw keys are covered by {@link aliasKeyPrototype}; serialized models hand out
+   * plain objects (`Object.assign({}, msg.id, …)` in `getMessageModel`), which
+   * need the property copied onto them individually — what the upstream patch
+   * does.
    */
   const aliasKey = (key: any): void => {
     if (!key || typeof key !== "object") return
     if (typeof key._serialized === "string") return
     if (typeof key.$1 !== "string") return
-    const proto = Object.getPrototypeOf(key)
-    if (proto && proto !== Object.prototype && !Object.prototype.hasOwnProperty.call(proto, "_serialized")) {
-      try {
-        Object.defineProperty(proto, "_serialized", {
-          configurable: true,
-          get(this: any) {
-            return this.$1
-          },
-        })
-        mark("messageKey._serialized")
-      } catch (err) {
-        note(err)
-      }
-    }
+    aliasKeyPrototype(Object.getPrototypeOf(key))
     if (typeof key._serialized !== "string") {
       try {
         Object.defineProperty(key, "_serialized", {
           value: key.$1,
           configurable: true,
           writable: true,
+          enumerable: true,
         })
       } catch (err) {
         note(err)
@@ -230,13 +254,20 @@ export function installWhatsAppCompat(): WhatsAppCompatReport {
     }
   }
 
-  // 1. The helper the upstream patch introduces, for callers that look it up.
+  // 1. Message keys: installed on the class up front, because it has to be in
+  //    place before the *first* key is built. whatsapp-web.js' own send path
+  //    looks a brand-new key up by `_serialized` (see `sendMessage` in the
+  //    library's injected utils), so waiting for a key to show up in a listing
+  //    is not enough.
+  aliasKeyPrototype(read(() => g.require("WAWebMsgKey").prototype, null))
+
+  // 2. The helper the upstream patch introduces, for callers that look it up.
   if (typeof W.getMsgKeyId !== "function") {
     W.getMsgKeyId = (key: any): string | undefined => idOf(key) || undefined
     mark("getMsgKeyId")
   }
 
-  // 2. Messages: alias the key, and never let one message break a listing.
+  // 3. Messages: alias the key, and never let one message break a listing.
   const originalGetMessageModel = W.getMessageModel
   if (typeof originalGetMessageModel === "function") {
     W.getMessageModel = function (this: any, ...args: any[]): any {
@@ -258,7 +289,7 @@ export function installWhatsAppCompat(): WhatsAppCompatReport {
     mark("getMessageModel")
   }
 
-  // 3. Chats: same, but the fallback has to keep `id` an object (see above).
+  // 4. Chats: same, but the fallback has to keep `id` an object (see above).
   const originalGetChatModel = W.getChatModel
   if (typeof originalGetChatModel === "function") {
     W.getChatModel = async function (this: any, ...args: any[]): Promise<any> {
@@ -281,7 +312,7 @@ export function installWhatsAppCompat(): WhatsAppCompatReport {
     mark("getChatModel")
   }
 
-  // 4. `getChats` as the upstream patch rewrites it: one bad chat costs one chat.
+  // 5. `getChats` as the upstream patch rewrites it: one bad chat costs one chat.
   const originalGetChats = W.getChats
   if (typeof originalGetChats === "function") {
     W.getChats = async function (this: any, ...args: any[]): Promise<any[]> {
