@@ -3,9 +3,9 @@
  * `whatsapp-web.js` 1.34.7 — the newest release — does not cope with.
  *
  * WhatsApp Web 2.3000.x renamed the serialized id of *message keys* from
- * `_serialized` to `$1` and made a few of its model getters throw for LID-based
- * chats. The library reads `msg.id._serialized` in ~30 places and maps every chat
- * with `chat.serialize()` inside one `Promise.all`, so on that build:
+ * `_serialized` to `$1`. The library reads `msg.id._serialized` in ~30 places
+ * and maps every chat with `chat.serialize()` inside one `Promise.all`, so on
+ * that build:
  *
  * - `client.getChatById()` rejects with an opaque `r: r` (WhatsApp's minified
  *   error for a lookup with an undefined key), which takes down *every* call our
