@@ -129,8 +129,38 @@ Architecture and conventions are documented in
 - **QR code does not show.** The QR is rendered inside a TUI modal
   (`qrcode` → half-block characters). Keep the terminal at a reasonable size and
   wait for the modal to appear; press `Esc` to hide it (it reappears on the next
-  `qr` event). If it never appears, check the log file for WhatsApp/Puppeteer
-  errors.
+  `qr` event).
+- **Never gets to the QR, or `initialize()` times out.** WhatsApp Web booted but
+  never launched its socket. ChitChat logs a **page state dump** to
+  `whatsapp.log` after each failed attempt — that dump is the place to look:
+
+  ```
+  [ERROR] [WhatsApp] Page state dump (attempt 1 failed: ...) | {
+    "href":"https://web.whatsapp.com/", "wwebVersion":"2.3000.…",
+    "socketState":"UNLAUNCHED", "wsReadyState":null,
+    "bodyText":"…" }
+  ```
+
+  Read it like this:
+  - `bodyText` is what the page is *showing*. If it mentions an unsupported
+    browser, an error, or a "scan the QR" prompt, that names the problem.
+  - `wwebVersion` is the live WhatsApp Web build. A stale build usually means a
+    cached app in the profile — run `chitchat --reset-whatsapp` and re-link.
+  - `socketState` stuck at `UNLAUNCHED`/`OPENING` with `wsReadyState` `null`
+    means WhatsApp's WebSocket never connected. This is usually **network-level**
+    (a blocked/NAT'd connection) or a **WhatsApp outage** — check that
+    `https://web.whatsapp.com` works in a normal browser on that machine, and
+    retry later.
+  - `page request failed` / `page http error` lines just above the dump show
+    exactly which resources failed, if any.
+
+  Reaching WhatsApp's WebSocket is a hard requirement; no client-side setting
+  can work around a blocked connection. To fail fast while debugging, set
+  `CHITCHAT_WHATSAPP_INIT_TIMEOUT_MS=45000` (default `180000`).
+- **Reset the WhatsApp session.** `chitchat --reset-whatsapp` deletes the saved
+  profile (`<data dir>/.wwebjs_auth`, which is a real Chromium user-data dir plus
+  any cached WhatsApp Web build) and exits; start again and scan the QR. Use it
+  when the app is stuck in a state that survives restarts.
 - **Stuck on "Authenticated…".** `whatsapp-web.js` sometimes never emits `ready`
   after `authenticated`. ChitChat polls the connection and proceeds automatically
   once it is `CONNECTED`, or after a bounded ~30 s wait. If chats are still

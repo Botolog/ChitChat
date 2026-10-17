@@ -31,6 +31,24 @@ function whatsappSessionDir(): string {
   return join(whatsappAuthDataPath(), "session")
 }
 
+/**
+ * How long a single `client.initialize()` may take before we give up on it.
+ * This covers booting Chromium, loading WhatsApp Web and launching its socket —
+ * not the QR scan itself, which happens after `initialize()` resolves. Override
+ * with `CHITCHAT_WHATSAPP_INIT_TIMEOUT_MS` (handy for fast local debugging).
+ */
+const INIT_TIMEOUT_MS = Number(process.env.CHITCHAT_WHATSAPP_INIT_TIMEOUT_MS) || 180000
+
+/**
+ * Minimal structural view of the puppeteer `Page` we touch for diagnostics.
+ * Declared locally so we do not depend on puppeteer's own typings (which arrive
+ * transitively through `whatsapp-web.js`).
+ */
+interface DiagnosticPage {
+  on(event: string, handler: (...args: never[]) => void): unknown
+  evaluate<T>(fn: () => T): Promise<T>
+}
+
 /** Capabilities advertised to the UI. */
 const WHATSAPP_CAPABILITIES: ServiceCapabilities = {
   qrAuth: true,
@@ -141,6 +159,10 @@ class WhatsAppService extends BaseMessagingService {
   private handlersRegistered = false
   /** Single-flight guard for `initialize()` so retries cannot overlap. */
   private initializePromise: Promise<void> | null = null
+  /** Interval that waits for `client.pupPage` so page diagnostics attach early. */
+  private diagnosticsPoll: NodeJS.Timeout | null = null
+  /** The page diagnostics are already attached to (attach at most once). */
+  private diagnosticsPage: unknown = null
 
   constructor() {
     super()
@@ -182,6 +204,7 @@ class WhatsAppService extends BaseMessagingService {
 
     this.client.on("ready", () => {
       logger.event("WhatsApp", "EVENT: ready - WhatsApp client is fully ready!")
+      void this.logWWebVersion()
       this.markReady("client ready event")
     })
 
@@ -350,6 +373,9 @@ class WhatsAppService extends BaseMessagingService {
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
         logger.error("WhatsApp", `Attempt ${attempt} failed`, { error: message })
+        // Capture what the page was actually showing — this is the only way to
+        // tell an unsupported-browser screen from a blocked WebSocket.
+        await this.dumpPageState(`attempt ${attempt} failed: ${message}`)
         // A live lock owner will not go away by retrying: fail fast with the
         // actionable message instead of burning the backoff window.
         if (err instanceof ProfileLockedError) {
@@ -390,6 +416,7 @@ class WhatsAppService extends BaseMessagingService {
         ownerPid: lock.ownerPid,
       })
     }
+    this.attachPageDiagnostics()
     return new Promise<void>((resolve, reject) => {
       const cleanup = () => {
         this.removeListener("ready", readyHandler)
@@ -413,7 +440,7 @@ class WhatsAppService extends BaseMessagingService {
       // instead of hanging the caller forever. Waiting for `ready` itself is
       // intentionally unbounded (that is the QR-scan wait, and the ready
       // fallback bounds it once authenticated).
-      this.withTimeout(this.client.initialize(), 180000, "client.initialize()").catch((err) => {
+      this.withTimeout(this.client.initialize(), INIT_TIMEOUT_MS, "client.initialize()").catch((err) => {
         cleanup()
         logger.error("WhatsApp", "client.initialize() threw error", {
           message: err instanceof Error ? err.message : String(err),
@@ -422,6 +449,141 @@ class WhatsAppService extends BaseMessagingService {
         reject(err)
       })
     })
+  }
+
+  /**
+   * Attach page-level diagnostics to the WhatsApp Web page.
+   *
+   * `whatsapp-web.js` only publishes `pupPage` once the browser has launched,
+   * which happens *inside* `initialize()`, so we poll briefly for it. Without
+   * this a page that boots but never connects — the classic "no QR, no ready,
+   * hangs forever" failure — is a complete black box: no console output, no
+   * failed requests, nothing in the log to work from.
+   */
+  private attachPageDiagnostics(): void {
+    if (this.diagnosticsPoll) return
+    const startedAt = Date.now()
+    this.diagnosticsPoll = setInterval(() => {
+      const page = (this.client as unknown as { pupPage?: DiagnosticPage }).pupPage
+      if (page) {
+        this.stopDiagnosticsPoll()
+        this.attachDiagnosticsTo(page)
+        return
+      }
+      if (Date.now() - startedAt > 30000) this.stopDiagnosticsPoll()
+    }, 200)
+    this.diagnosticsPoll.unref?.()
+  }
+
+  private stopDiagnosticsPoll(): void {
+    if (this.diagnosticsPoll) {
+      clearInterval(this.diagnosticsPoll)
+      this.diagnosticsPoll = null
+    }
+  }
+
+  private attachDiagnosticsTo(page: DiagnosticPage): void {
+    if (this.diagnosticsPage === page) return
+    this.diagnosticsPage = page
+    logger.info("WhatsApp", "Page diagnostics attached")
+
+    page.on("console", (msg: never) => {
+      const m = msg as unknown as { type?: () => string; text?: () => string }
+      logger.debug("WhatsApp", "page console", { type: m.type?.(), text: m.text?.() })
+    })
+    page.on("pageerror", (err: never) => logger.error("WhatsApp", "page error", err))
+    // Request noise is only interesting while WhatsApp Web is booting; once the
+    // client is ready these would just fill the log with analytics/beacon 404s.
+    page.on("requestfailed", (req: never) => {
+      if (this.ready) return
+      const r = req as unknown as {
+        url?: () => string
+        failure?: () => { errorText?: string } | null
+      }
+      logger.warn("WhatsApp", "page request failed", {
+        url: r.url?.(),
+        error: r.failure?.()?.errorText,
+      })
+    })
+    page.on("response", (res: never) => {
+      if (this.ready) return
+      const r = res as unknown as { url?: () => string; status?: () => number }
+      const status = r.status?.()
+      if (typeof status === "number" && status >= 400) {
+        logger.warn("WhatsApp", "page http error", { url: r.url?.(), status })
+      }
+    })
+  }
+
+  /**
+   * Log a snapshot of the WhatsApp Web page so a stuck/failed initialization can
+   * be diagnosed from the log alone. `bodyText` is the giveaway: it shows the
+   * screen WhatsApp is actually displaying (e.g. "your browser is not
+   * supported", an error page, or the QR view) while `socketState` says whether
+   * WhatsApp's own WebSocket ever launched.
+   */
+  private async dumpPageState(reason: string): Promise<void> {
+    const page = (this.client as unknown as { pupPage?: DiagnosticPage }).pupPage
+    if (!page?.evaluate) {
+      logger.warn("WhatsApp", "Page state unavailable", { reason, hasPage: Boolean(page) })
+      return
+    }
+    try {
+      const state = await this.withTimeout(
+        page.evaluate(() => {
+          const g = globalThis as unknown as Record<string, any>
+          let socket: any = null
+          try {
+            socket = g.require("WAWebSocketModel").Socket
+          } catch {
+            socket = null
+          }
+          return {
+            href: g.location?.href ?? null,
+            title: g.document?.title ?? null,
+            readyState: g.document?.readyState ?? null,
+            online: g.navigator?.onLine ?? null,
+            userAgent: g.navigator?.userAgent ?? null,
+            wwebVersion: g.Debug?.VERSION ?? null,
+            wwebjsInjected: typeof g.WWebJS !== "undefined",
+            socketState: socket?.state ?? null,
+            socketStream: socket?.stream ?? null,
+            wsReadyState: socket?.socket?.readyState ?? null,
+            hasSynced: socket?.hasSynced ?? null,
+            bodyText: String(g.document?.body?.innerText ?? "")
+              .replace(/\s+/g, " ")
+              .slice(0, 400),
+          }
+        }),
+        15000,
+        "dumpPageState()",
+      )
+      logger.error("WhatsApp", `Page state dump (${reason})`, state)
+    } catch (err) {
+      logger.error("WhatsApp", "Failed to dump page state", err)
+    }
+  }
+
+  /**
+   * Log the WhatsApp Web build the page is running. Worth having on the happy
+   * path too: WhatsApp occasionally ships a web build that breaks the version of
+   * `whatsapp-web.js` in use, and knowing the exact build makes that obvious.
+   */
+  private async logWWebVersion(): Promise<void> {
+    const page = (this.client as unknown as { pupPage?: DiagnosticPage }).pupPage
+    if (!page?.evaluate) return
+    try {
+      const version = await this.withTimeout(
+        page.evaluate(
+          () => (globalThis as unknown as Record<string, any>).Debug?.VERSION ?? null,
+        ),
+        5000,
+        "logWWebVersion()",
+      )
+      logger.info("WhatsApp", "WhatsApp Web version", { version })
+    } catch {
+      // Best effort only.
+    }
   }
 
   getQrCode(): string | null {
@@ -986,6 +1148,8 @@ class WhatsAppService extends BaseMessagingService {
 
   protected override async teardown(): Promise<void> {
     logger.info("WhatsApp", "Destroying client")
+    this.stopDiagnosticsPoll()
+    this.diagnosticsPage = null
     this.clearReadyFallback()
     this.ready = false
     this.qrCode = null
