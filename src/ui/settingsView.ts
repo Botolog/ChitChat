@@ -1,3 +1,5 @@
+import { writeFileSync } from "node:fs"
+import { join } from "node:path"
 import {
   BoxRenderable,
   TextRenderable,
@@ -9,6 +11,7 @@ import {
   getNestedSetting,
   setNestedSetting,
   getKeybindingsSettings,
+  getSettings,
   type SettingSection,
 } from "../settings"
 import {
@@ -263,6 +266,21 @@ export function handleKeyCapture(ctx: AppContext, key: KeyEvent): boolean {
   return true
 }
 
+/** Write the current settings to a JSON file in the working directory. */
+function exportSettings(ctx: AppContext): void {
+  const target = join(process.cwd(), "chitchat-settings-export.json")
+  try {
+    writeFileSync(target, JSON.stringify(getSettings(), null, 2), { mode: 0o600 })
+    logger.info("Settings", "Exported settings", { target })
+    ctx.status.set(`● Exported to ${target}`, ctx.theme.colors.primary)
+    ctx.status.revertAfter(4000, { content: "● Connected" })
+  } catch (err) {
+    logger.error("Settings", "Failed to export settings", err)
+    ctx.status.set("✗ Failed to export settings", "#F15C6D")
+    ctx.status.revertAfter(3000, { content: "● Connected" })
+  }
+}
+
 /** Activate the currently selected settings item (toggle/cycle/capture/action). */
 export function toggleCurrentSetting(ctx: AppContext): void {
   const { state } = ctx
@@ -282,6 +300,10 @@ export function toggleCurrentSetting(ctx: AppContext): void {
       mediaCache.clear()
       ctx.status.set("● Media cache cleared", colors.primary)
       ctx.status.revertAfter(2000, { content: "● Connected" })
+      return
+    }
+    if (item.id === "exportSettings") {
+      exportSettings(ctx)
       return
     }
     if (item.action) {

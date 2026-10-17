@@ -2,12 +2,17 @@ import { createHash } from "node:crypto"
 import { existsSync, rmSync } from "node:fs"
 import { mkdir, rename, rm, writeFile } from "node:fs/promises"
 import { join, resolve } from "node:path"
+import { resolveDataPath } from "./paths"
 
 /**
  * Default on-disk location for cached media. The directory is created lazily on
  * the first write; importing this module performs **no** filesystem I/O.
+ *
+ * Resolved lazily so `CHITCHAT_DATA_DIR` set after import is still honoured.
  */
-const DEFAULT_CACHE_DIR = resolve(process.cwd(), ".media-cache")
+function defaultCacheDir(): string {
+  return resolveDataPath(".media-cache")
+}
 
 /** Extensions we may append to a cached file, derived from its MIME type. */
 const MIME_EXTENSIONS: Record<string, string> = {
@@ -80,7 +85,7 @@ export class MediaCache {
   private readonly index = new Map<string, string>()
 
   constructor(options: MediaCacheOptions = {}) {
-    this.cacheDir = options.directory ? resolve(options.directory) : DEFAULT_CACHE_DIR
+    this.cacheDir = options.directory ? resolve(options.directory) : defaultCacheDir()
     this.maxEntries = options.maxEntries ?? 512
   }
 

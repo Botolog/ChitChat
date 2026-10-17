@@ -1,18 +1,19 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "fs"
-import { dirname, join } from "path"
+import { dirname } from "path"
 import { logger } from "./utils/logger"
+import { resolveDataPath } from "./utils/paths"
 
 /**
  * Resolve the settings file location.
  *
  * Keeps the historical default (`<cwd>/.chitchat-settings.json`) but honours
- * `CHITCHAT_SETTINGS_PATH` so tests / packagers can relocate it. Evaluated
- * lazily so callers may set the env var before the first load/save.
+ * `CHITCHAT_SETTINGS_PATH` (explicit file) and `CHITCHAT_DATA_DIR` (base dir).
+ * Evaluated lazily so callers may set the env var before the first load/save.
  */
 function getSettingsPath(): string {
   const override = process.env.CHITCHAT_SETTINGS_PATH
   if (override && override.trim().length > 0) return override
-  return join(process.cwd(), ".chitchat-settings.json")
+  return resolveDataPath(".chitchat-settings.json")
 }
 
 export interface AppSettings {
@@ -439,8 +440,7 @@ const MAIN_SETTINGS: SettingSection[] = [
     title: "📋 Actions",
     items: [
       { id: "clearMediaCache", label: "Clear Media Cache", type: "button" },
-      { id: "clearCache", label: "Clear Cache", type: "button", action: () => { /* TODO */ } },
-      { id: "exportSettings", label: "Export Settings", type: "button", action: () => { /* TODO */ } },
+      { id: "exportSettings", label: "Export Settings", type: "button" },
       { id: "resetSettings", label: "Reset to Defaults", type: "button", action: () => {
         currentSettings = cloneDefaults()
         saveSettings(currentSettings)

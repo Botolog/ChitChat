@@ -1,6 +1,6 @@
 name: chitchat
 base: core22
-version: '0.0.1a'
+version: '0.1.0'
 summary: Universal Terminal Messaging Client
 description: |
   ChitChat is a terminal-based messaging client that supports multiple platforms.

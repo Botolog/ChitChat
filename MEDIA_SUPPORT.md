@@ -1,124 +1,130 @@
-# Media Support Implementation Summary
+# Media Support
 
-## ✅ Completed Features
+ChitChat can display and open media attached to messages. Media is represented
+as metadata and downloaded lazily; nothing is fetched until it is rendered or
+opened.
 
-### 1. **Data Structures**
-- `MediaAttachment` interface for images, videos, audio, documents, stickers
-- Extended `MessageData` to include media field
-- Media metadata: type, mimetype, filename, filesize, thumbnail
+## Data model
 
-### 2. **Media Caching System** (`src/utils/mediaCache.ts`)
-- Local filesystem cache in `.media-cache/` directory
-- MD5-based cache keys
-- Automatic file extension detection
-- Cache checking and retrieval
+`src/services/types.ts` defines `MediaAttachment`:
 
-### 3. **Terminal Capability Detection** (`src/utils/terminalCapabilities.ts`)
-- Auto-detects Kitty, iTerm2, Sixel, color support
-- `getOptimalDisplayMode()` for best rendering method
-- Supports manual override via settings
-
-### 4. **Media Renderer** (`src/utils/mediaRenderer.ts`)
-Implements ALL requested approaches:
-- **Indicator mode**: File icons (📷🎥🎵📎) + filename + size + "'space' to open"
-- **ASCII art mode**: Image-to-ASCII conversion (placeholder for now)
-- **Kitty protocol**: Real image rendering using Kitty graphics protocol
-- **iTerm2 protocol**: Real image rendering using iTerm2 inline images
-- **Sixel graphics**: Sixel image protocol (placeholder for now)
-- **HTTP mode**: Local server + browser (not yet implemented)
-- `openMedia()`: Cross-platform file opening (xdg-open, open, start)
-
-### 5. **WhatsApp Integration**
-- `formatMessage()` extracts media info from messages
-- `getMediaType()` maps WhatsApp types to MediaAttachment types
-- `downloadMedia()` downloads and caches media files
-- Supports images, videos, audio, documents, stickers
-
-### 6. **Settings**
-Added to `AppSettings`:
-- `mediaDisplayMode`: "auto" | "indicator" | "ascii" | "kitty" | "iterm2" | "sixel" | "http"
-- `showMediaThumbnails`: boolean
-- `maxThumbnailSize`: number (pixels)
-
-Defaults:
-- Mode: "auto" (best for terminal)
-- Thumbnails: enabled
-- Max size: 80px
-
-### 7. **UI Integration**
-- `renderMessages()` now async, calls `mediaRenderer.render()`
-- Shows media indicators/previews in message bubbles
-- Fallback to icon + type if media not yet downloaded
-- Media renderer initialized when entering service
-
-### 8. **Git Configuration**
-- Added `.media-cache/` to `.gitignore`
-
-## ✅ Recently Completed
-
-### 1. **Keyboard Shortcuts** ✅
-- `o` key: Downloads and opens media from current chat
-- Opens with default system app or browser (HTTP mode)
-- Shows download progress in status bar
-
-### 2. **Settings Menu** ✅
-- Added ⚙️ Settings to main menu
-- Media Display Mode selector in settings
-- All media settings configurable
-
-### 3. **Full Implementations** ✅
-- **Kitty graphics**: Real inline images using Kitty protocol with base64 transmission
-- **iTerm2 images**: Real inline images using iTerm2 inline image protocol
-- **Sixel rendering**: Using ImageMagick `convert` command with sixel output
-- **ASCII art**: Using `jp2a` command-line tool for text-based previews
-- **HTTP server mode**: Full web gallery with auto-start server on port 8765+
-
-## 📝 Usage
-
-### For Users
-1. Media messages show with icon + filename + size
-2. In supported terminals (Kitty/iTerm2), images show inline
-3. Press 'Space' on a media message to open in default app
-4. Configure display mode in Settings → Media Display
-
-### For Developers
-```typescript
-// Download media from a message
-const filePath = await whatsappService.downloadMedia(messageId, chatId)
-
-// Render media in UI
-const mediaLines = await mediaRenderer.render(message.media, maxWidth)
-
-// Open media externally
-await mediaRenderer.openMedia(filePath)
+```ts
+interface MediaAttachment {
+  type: "image" | "video" | "audio" | "sticker" | "document"
+  mimetype: string
+  filename: string
+  filesize?: number
+  messageId: string   // message that owns the media; used as the cache key
+}
 ```
 
-## 🎨 Display Modes
+Messages carry an optional `media` field plus a `hasMedia` flag. The bytes are
+**never** carried on the object — the UI downloads them on demand via
+`MessagingService.downloadMedia(messageId, chatId)`.
 
-| Mode | Description | Terminal Support |
-|------|-------------|-----------------|
-| **auto** | Best for your terminal | All |
-| **indicator** | Icon + filename only | All |
-| **ascii** | ASCII art preview | All (needs colors) |
-| **kitty** | High-quality images | Kitty, WezTerm |
-| **iterm2** | High-quality images | iTerm2 |
-| **sixel** | Retro graphics | xterm, mlterm, foot |
-| **http** | Browser viewer | All (opens browser) |
+## Media cache
 
-## 🔧 Libraries Used
+`src/utils/mediaCache.ts` stores downloaded bytes on disk and tracks them in a
+bounded in-memory index:
 
-- `@slack/web-api`, `@slack/socket-mode` - Slack API
-- `whatsapp-web.js` - WhatsApp Web API
-- No additional dependencies for media (uses built-in Node.js)
+- Default directory `<cwd>/.media-cache`; constructed lazily (no I/O at import).
+- Preferred key: `msg:<messageId>`. A legacy `chat_file_timestamp` key shape is
+  also supported.
+- Filenames are deterministic **SHA-1 hashes** of the key, so they can never
+  contain path separators or traversal sequences.
+- Writes are atomic (`tmp` file + `rename`).
+- An LRU-ish index (default 512 entries) keeps lookups fast and evicts old files.
+- `clear()` / `clearAsync()` wipe the cache (wired to Settings → Actions →
+  Clear Media Cache).
 
-## 🚀 Next Steps
+## Terminal capability detection
 
-1. ~~Add keyboard shortcut implementation~~ ✅ DONE
-2. ~~Update settings menu~~ ✅ DONE
-3. ~~Install optional libraries for ASCII/Sixel~~ ✅ Uses system tools
-4. ~~Implement HTTP server mode~~ ✅ DONE
-5. Auto-download media on message load for inline previews
-6. Support media uploads
-7. Install optional dependencies:
-   - `jp2a` for ASCII art (optional): `apt install jp2a` or `brew install jp2a`
-   - ImageMagick with Sixel support (optional): `apt install imagemagick`
+`src/utils/terminalCapabilities.ts` inspects `TERM`, `TERM_PROGRAM` and
+`COLORTERM` and reports Kitty/iTerm2/Sixel and colour support.
+`getOptimalDisplayMode()` picks the best supported mode; the settings value
+`auto` resolves through it when a service is entered.
+
+## Display modes
+
+`mediaDisplayMode` selects the renderer used for each attachment:
+
+| Mode | Output | Requires |
+|------|--------|----------|
+| `auto` | Best mode for the current terminal (resolved at service entry) | — |
+| `indicator` | Icon + filename + size + open hint | — |
+| `ascii` | ASCII-art preview, then the indicator line | cached image + `jp2a` |
+| `kitty` | Inline image (Kitty graphics protocol) | Kitty/WezTerm + cached image |
+| `iterm2` | Inline image (OSC 1337) | iTerm2 + cached image |
+| `sixel` | Sixel graphics | Sixel terminal + cached image + ImageMagick `convert` |
+| `http` | Local browser gallery link | — |
+
+`MediaRenderer` (`src/utils/mediaRenderer.ts`) never throws: if the cached file
+is missing or a helper tool is unavailable, every image mode degrades to the
+ASCII preview and then to the plain indicator.
+
+Implementation details:
+
+- **Kitty** – PNG data is transmitted inline as base64 in `m=1`/`m=0` chunks of
+  4096 bytes (`f=100`, `a=T`); formats Kitty cannot decode inline (JPEG/GIF/
+  WebP/BMP) are sent by file reference (`t=f`).
+- **iTerm2** – `OSC 1337;File=inline=1;...:<base64>` with the filename and size
+  encoded per the specification.
+- **Sixel** – `convert <file> -resize <width>x sixel:-`, normalized into a DCS
+  sequence terminated with ST.
+- **ASCII** – `jp2a --width=<n> --height=20 <file>`, capped to 15 lines.
+- All helper processes run with a 5 s timeout and a bounded buffer, so they
+  cannot leak or hang the TUI.
+
+## Download and open flow
+
+1. Pressing the open-media key (default `Enter`, see
+   [KEYBINDINGS.md](KEYBINDINGS.md)) on a selected message calls
+   `handleOpenMedia()` in `src/input/mediaActions.ts`.
+2. `ensureMediaCached()` returns the cached path, or downloads via
+   `downloadMedia()` and re-caches the bytes under the message id.
+3. In HTTP mode the gallery server is started and the browser is opened;
+   otherwise the cached file is opened with the platform handler
+   (`xdg-open` / `open` / `start`).
+
+`autoDownloadMediaOnEnter` (Settings → Chat) pre-downloads a chat's media when
+the chat is opened, so images are ready for inline rendering.
+
+## Local HTTP gallery
+
+`src/utils/mediaServer.ts` is a loopback-only (`127.0.0.1`) server used by HTTP
+mode:
+
+- Serves an HTML gallery at `/` and files at `/media/<name>`.
+- Starts on port `8765`, walking forward on `EADDRINUSE` (up to 10 retries).
+- Rejects path traversal (including percent-encoded forms) with `403`.
+- HTML-escapes every dynamic value in the gallery.
+- Sends `X-Content-Type-Options: nosniff` and `Cache-Control: no-store`.
+- `stop()` closes the server and clears its timers; it performs no filesystem
+  work at import time.
+
+## Settings
+
+Stored in `.chitchat-settings.json`:
+
+| Setting | Values | Status |
+|---------|--------|--------|
+| `mediaDisplayMode` | `auto`, `indicator`, `ascii`, `kitty`, `iterm2`, `sixel`, `http` | Used to pick the renderer |
+| `autoDownloadMediaOnEnter` | boolean | Used to pre-download a chat's media |
+| `autoDownloadMedia` | `always`, `wifi`, `never` | Persisted |
+| `mediaQuality` | `low`, `medium`, `high` | Persisted |
+| `showMediaThumbnails` | boolean | Persisted |
+| `maxThumbnailSize` | pixels | Persisted |
+
+## Optional external tools
+
+- **`jp2a`** – ASCII-art previews (`apt install jp2a` / `brew install jp2a`).
+- **ImageMagick `convert`** – Sixel output (`apt install imagemagick`).
+
+Without them, the corresponding modes simply fall back to the indicator line.
+
+## Backend support
+
+Only backends declaring `downloadMedia` in their capabilities can fetch media —
+currently WhatsApp. Messages with media on a backend without download support
+still render the indicator, but opening them reports the failure in the status
+bar.

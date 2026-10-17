@@ -1,18 +1,19 @@
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "fs"
-import { dirname, join } from "path"
+import { dirname } from "path"
 import { logger } from "./utils/logger"
+import { resolveDataPath } from "./utils/paths"
 
 /**
  * Resolve the keybindings file location.
  *
  * Keeps the historical default (`<cwd>/.chitchat-keybindings.json`) but honours
- * `CHITCHAT_KEYBINDINGS_PATH`. Evaluated lazily so callers may set the env var
- * before the first load/save.
+ * `CHITCHAT_KEYBINDINGS_PATH` (explicit file) and `CHITCHAT_DATA_DIR` (base dir).
+ * Evaluated lazily so callers may set the env var before the first load/save.
  */
 function getKeybindingsPath(): string {
   const override = process.env.CHITCHAT_KEYBINDINGS_PATH
   if (override && override.trim().length > 0) return override
-  return join(process.cwd(), ".chitchat-keybindings.json")
+  return resolveDataPath(".chitchat-keybindings.json")
 }
 
 export interface KeyBinding {

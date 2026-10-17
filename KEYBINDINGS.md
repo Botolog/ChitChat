@@ -1,139 +1,139 @@
-# Keybindings Configuration
+# Keybindings
 
-ChitChat supports fully configurable keybindings through a JSON configuration file.
+ChitChat's action keys are fully configurable through a JSON file. Navigation
+keys (arrows, `Tab`, `Esc`, `1`–`9`, `Enter`) are fixed.
 
-## Configuration File
+## Configuration file
 
-The keybindings are stored in `.chitchat-keybindings.json` in the application directory. This file is automatically created with default keybindings on first run.
+Keybindings live in `.chitchat-keybindings.json`, resolved relative to the
+current working directory. Set `CHITCHAT_KEYBINDINGS_PATH` to use a different
+location.
 
-## Keybinding Format
+The file is created on the first save (Reset or capturing a new key) and written
+atomically with mode `0o600`. On load it is validated against the defaults:
+unknown fields are dropped, wrong types fall back per field, and modifiers are
+only trusted when explicitly `true`.
 
-Each keybinding has the following structure:
+## Binding format
 
 ```json
 {
-  "key": "string",
-  "ctrl": boolean (optional),
-  "shift": boolean (optional),
-  "alt": boolean (optional),
-  "description": "string"
-}
-```
-
-### Key Names
-
-Common key names:
-- Letter keys: `"a"`, `"b"`, `"c"`, etc.
-- Special keys: `"return"`, `"escape"`, `"space"`, `"backspace"`, `"delete"`, `"insert"`, `"tab"`
-- Arrow keys: `"up"`, `"down"`, `"left"`, `"right"`
-- Function keys: `"f1"`, `"f2"`, `"f3"`, etc.
-
-### Modifiers
-
-- `ctrl`: true/false - Ctrl key must be pressed
-- `shift`: true/false - Shift key must be pressed
-- `alt`: true/false - Alt key must be pressed
-
-If a modifier is not specified or set to `false`, it should not be pressed.
-
-## Available Keybindings
-
-### Global
-- `quit` - Quit application (default: Ctrl+Q)
-- `settings` - Open settings (default: F2)
-- `help` - Toggle help (default: ?)
-
-### Navigation
-- `navigateUp` - Navigate up (default: ↑)
-- `navigateDown` - Navigate down (default: ↓)
-- `navigateLeft` - Navigate left (default: ←)
-- `navigateRight` - Navigate right (default: →)
-- `selectItem` - Select item (default: Enter)
-- `goBack` - Go back (default: Esc)
-
-### Chat List
-- `refreshChats` - Refresh chat list (default: Ctrl+R)
-- `pinChat` - Pin/unpin chat (default: Ctrl+P)
-- `muteChat` - Mute/unmute chat (default: Ctrl+M)
-- `archiveChat` - Archive chat (default: Ctrl+A)
-
-### Message Navigation
-- `messageUp` - Previous message (default: ↑)
-- `messageDown` - Next message (default: ↓)
-- `jumpToReply` - Jump to replied message (default: Space)
-- `setReplyReference` - Set as reply reference (default: R)
-- `openMedia` - Open media (default: Enter)
-- `deleteMessageForMe` - Delete message for me (default: Backspace)
-- `deleteMessageForEveryone` - Delete message for everyone (default: Delete)
-- `editMessage` - Edit message (default: Insert)
-
-### Input
-- `sendMessage` - Send message (default: Enter)
-- `newLine` - New line (default: Shift+Enter)
-- `cancelEdit` - Cancel edit (default: Esc)
-
-### Settings Navigation
-- `settingsUp` - Previous setting (default: ↑)
-- `settingsDown` - Next setting (default: ↓)
-- `settingsToggle` - Toggle setting (default: Enter)
-- `settingsClose` - Close settings (default: Esc)
-- `settingsNextPage` - Next settings page (default: Tab)
-- `settingsPrevPage` - Previous settings page (default: Shift+Tab)
-
-## Example Customizations
-
-### Change reply keybinding to Ctrl+R
-```json
-{
-  "setReplyReference": {
-    "key": "r",
+  "quit": {
+    "key": "q",
     "ctrl": true,
-    "description": "Set as reply reference"
+    "description": "Quit application"
   }
 }
 ```
 
-### Change media open to M key
+- `key` (string, required) — the key name.
+- `ctrl`, `shift`, `alt` (boolean, optional) — modifiers.
+- `description` (string) — shown in the settings UI and help.
+
+**Modifier semantics:** matching is exact. A modifier listed (or `true`) in the
+binding **must** be pressed, and every modifier **not** listed **must not** be
+pressed. A plain key never matches a `Ctrl`/`Shift`/`Alt` combination, and vice
+versa.
+
+### Key names
+
+- Letters/numbers/punctuation: `"a"`, `"1"`, `"?"`, `"/"`, …
+- Special keys: `"return"`, `"escape"`, `"space"`, `"backspace"`, `"delete"`,
+  `"insert"`, `"tab"`
+- Arrows: `"up"`, `"down"`, `"left"`, `"right"`
+- Function keys: `"f1"`, `"f2"`, …
+
+Displayed names are prettified (`return` → `Enter`, `escape` → `Esc`,
+`delete` → `Del`, `up` → `↑`, and so on).
+
+## Default keybindings
+
+Global:
+
+| Action | Key | Description |
+|--------|-----|-------------|
+| `quit` | `Ctrl+Q` | Quit application |
+| `settings` | `F2` | Open settings |
+| `help` | `?` | Toggle help |
+
+Chat list:
+
+| Action | Key | Description |
+|--------|-----|-------------|
+| `refreshChats` | `Ctrl+R` | Refresh chat list |
+| `pinChat` | `Ctrl+P` | Pin/unpin chat |
+| `muteChat` | `Ctrl+M` | Mute/unmute chat |
+| `archiveChat` | `Ctrl+A` | Archive chat |
+
+Message actions:
+
+| Action | Key | Description |
+|--------|-----|-------------|
+| `jumpToReply` | `Space` | Jump to replied message |
+| `setReplyReference` | `R` | Set as reply reference |
+| `openMedia` | `Enter` | Open media |
+| `deleteMessageForMe` | `Backspace` | Delete message for me |
+| `deleteMessageForEveryone` | `Delete` | Delete message for everyone |
+| `editMessage` | `Insert` | Edit message |
+
+Actions are only available for messages where the backend reports the matching
+capability (see the table in the [README](README.md#supported-services)).
+
+## Non-configurable keys
+
+| Key | Context | Action |
+|-----|---------|--------|
+| `↑` / `↓` | Main menu | Move selection |
+| `Enter` | Main menu | Open the selected service / item |
+| `Q` | Main menu | Quit |
+| `↑` / `↓` | Chat list | Move selection |
+| `1`–`9` | Service view | Quick-select a chat by index |
+| `Tab` | Service view | Cycle focus between panels |
+| `↑` | Input | Move focus into the message list |
+| `↓` | Input | Scroll to the newest message |
+| `Enter` | Input | Send the message |
+| `Esc` | Service view | Return to the chat list / main menu |
+| `Y` / `N` / `Esc` | Confirm modal | Yes / No / Cancel |
+| `Ctrl+C` | Anywhere | Quit |
+
+> The media indicator line reads `['space' to open]`, but the default open-media
+> binding is `Enter` (with `Space` bound to *jump to reply*). Change either key
+> below if you prefer the hint's wording.
+
+## Customizing
+
+### In the app (recommended)
+
+1. Press `F2` to open settings, then `Tab` to the **Keybindings** page.
+2. Move to an action and press `Enter` to start capture.
+3. Press the desired key combination. `Esc` cancels.
+4. The new binding is saved immediately and applied to the running app.
+
+### By editing the file
+
+Edit `.chitchat-keybindings.json` and restart the app:
+
 ```json
 {
-  "openMedia": {
-    "key": "m",
-    "description": "Open media"
-  }
+  "setReplyReference": { "key": "r", "ctrl": true, "description": "Set as reply reference" },
+  "openMedia": { "key": "m", "description": "Open media" },
+  "messageUp": { "key": "k", "description": "Previous message" }
 }
 ```
 
-### Use Vim-style navigation
-```json
-{
-  "messageUp": {
-    "key": "k",
-    "description": "Previous message"
-  },
-  "messageDown": {
-    "key": "j",
-    "description": "Next message"
-  }
-}
-```
+The file does not need every action: missing actions fall back to their
+defaults.
 
-## Notes
+## Notes & troubleshooting
 
-- **Terminal Limitations**: Some key combinations (like Ctrl+Enter) may not work in all terminals due to how they handle key events. If a keybinding doesn't work, try a different key combination.
-- **Conflicts**: Avoid assigning the same key combination to multiple actions in the same context.
-- **Reload**: Changes to the keybindings file require restarting the application.
-- **Reset**: Delete `.chitchat-keybindings.json` to restore default keybindings.
-
-## Troubleshooting
-
-If keybindings aren't working:
-
-1. Check the log file (`chitchat.log`) for keybinding loading errors
-2. Verify your JSON syntax is correct
-3. Ensure key names match the expected format
-4. Test if the key combination works in your terminal (some terminals don't support all combinations)
-5. Try using a different key combination
-
-## Default Keybindings File
-
-The default keybindings file is included as `.chitchat-keybindings.json` and serves as a reference for customization.
+- **Reload:** hand-edited files require a restart; changes made through the
+  settings UI apply immediately.
+- **Reset:** delete `.chitchat-keybindings.json` (or use Settings → Actions →
+  Reset to Defaults) to restore the defaults.
+- **Conflicts:** avoid assigning the same combination to two actions active in
+  the same context — the first dispatcher stage wins (see the precedence order in
+  [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md#key-dispatch)).
+- **Terminal limits:** some combinations (e.g. `Ctrl+Enter`) are not reported by
+  every terminal. If a binding does not fire, try a different combination.
+- **Diagnostics:** keybinding load/save and key-capture events are written to the
+  log file. Verify your JSON syntax first.
