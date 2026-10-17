@@ -206,11 +206,14 @@ export class Logger {
   private path: string
   private sink: LogSink
   private level: LogLevel | null
+  /** Context used when a call passes an empty context string. */
+  private label: string
 
   constructor(filename: string, context: string = "Service") {
     this.path = resolveLogPath(filename)
     this.sink = sinkFor(this.path, context)
     this.level = null
+    this.label = context
   }
 
   /** Default threshold for every logger that has no explicit per-instance level. */
@@ -234,6 +237,7 @@ export class Logger {
     child.path = this.path
     child.sink = this.sink
     child.level = null
+    child.label = context
     return child
   }
 
@@ -264,7 +268,7 @@ export class Logger {
 
   private emit(tag: string, kind: LogLevel, context: string, message: string, data?: unknown): void {
     if (!this.enabled(kind)) return
-    const line = formatLine(tag, context, message, data)
+    const line = formatLine(tag, context || this.label, message, data)
     if (mirrorToStdout) {
       try {
         process.stdout.write(line)

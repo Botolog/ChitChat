@@ -145,8 +145,12 @@ export class MediaServer {
           logger.error("MediaServer", "Server error", err)
         })
         this.server = server
-        this.port = port
-        this.url = `http://${BIND_HOST}:${port}`
+        // Use the actually-bound port: with `port: 0` the OS assigns an
+        // ephemeral port, so `port` (the request) would be wrong.
+        const address = server.address()
+        const boundPort = address && typeof address === "object" ? address.port : port
+        this.port = boundPort
+        this.url = `http://${BIND_HOST}:${boundPort}`
         logger.info("MediaServer", "Started", { url: this.url })
         resolveStart(this.url)
       }
