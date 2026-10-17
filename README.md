@@ -177,6 +177,16 @@ Architecture and conventions are documented in
   after `authenticated`. ChitChat polls the connection and proceeds automatically
   once it is `CONNECTED`, or after a bounded ~30 s wait. If chats are still
   empty, restart the app.
+- **Connected but no chats listed.** ChitChat reads the chat list straight from
+  WhatsApp Web instead of `client.getChats()`, which rejects the *whole* list
+  when a single chat fails to serialize on current WhatsApp Web builds (upstream
+  [`whatsapp-web.js#201845`](https://github.com/wwebjs/whatsapp-web.js/issues/201845),
+  logged as a cryptic `r: r`). Each chat is mapped on its own now, and the list is
+  re-read while it is still empty, so it fills in as WhatsApp finishes restoring
+  its local database — give it a few seconds after connecting. If it stays empty
+  and `whatsapp.log` shows a `collectionError`, WhatsApp Web's internals have
+  moved again; `chitchat --reset-whatsapp` and re-linking is the first thing to
+  try.
 - **"Could not find Chrome".** Puppeteer could not locate the exact browser
   revision it expects. Install a matching browser, let Puppeteer download one, or
   set `PUPPETEER_EXECUTABLE_PATH` to an existing Chromium/Chrome binary. For the

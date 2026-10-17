@@ -8,6 +8,11 @@ import { renderQrBlocks } from "../utils/qr"
 import { resolveDataPath } from "../utils/paths"
 import { recoverProfileLock, ProfileLockedError } from "../utils/profileLock"
 import { clearWhatsAppTabState } from "../utils/whatsappTabState"
+import {
+  collectWhatsAppChats,
+  type CollectChatsResult,
+  type WhatsAppChatModel,
+} from "../utils/whatsappChats"
 import { BaseMessagingService } from "./base"
 import type { ServiceCapabilities } from "./capabilities"
 import type {
@@ -63,34 +68,12 @@ const WHATSAPP_CAPABILITIES: ServiceCapabilities = {
 }
 
 /**
- * Structural view of a chat used by `formatChat`.
- *
- * Field names deliberately avoid the WhatsApp `Chat` class members that are
- * methods (`pin`, `mute`, `archive`) so both `Chat` instances and the plain
- * objects returned by the `window.Store` fast path can be normalized here.
+ * Structural view of a chat used by `formatChat`: both whatsapp-web.js chat
+ * models and the objects our own in-page reader builds (utils/whatsappChats).
  */
-interface ChatLike {
-  id?: string | { _serialized?: string }
-  name?: string
-  formattedTitle?: string
-  isGroup?: boolean
-  unreadCount?: number
-  archived?: boolean
-  pinned?: boolean
-  isMuted?: boolean
-  muteExpiration?: number
-  t?: number
-  timestamp?: number
-  participantCount?: number
-  lastMessage?: {
-    body?: string
-    timestamp?: number
-    fromMe?: boolean
-    id?: { fromMe?: boolean }
-  }
-}
+type ChatLike = WhatsAppChatModel
 
-/** Minimal Puppeteer `Page` surface used for the `window.Store` fast path. */
+/** Minimal Puppeteer `Page` surface used to read WhatsApp Web's own state. */
 interface StorePage {
   evaluate<T>(pageFunction: () => T | Promise<T>): Promise<T>
 }
@@ -643,87 +626,49 @@ class WhatsAppService extends BaseMessagingService {
       return []
     }
 
-    // Fast path: read WhatsApp Web's internal Store directly (the public
-    // client.getChats() can hang for a long time on newer versions). Any
-    // failure — missing pupPage, evaluate throwing, Store unavailable, or the
-    // bounded wait — falls through to the public API.
-    let chats: ChatLike[] | null = null
+    // Read WhatsApp Web's chat collection directly instead of going through
+    // `client.getChats()`, which rejects the whole list as soon as one chat
+    // fails to map (see utils/whatsappChats). Any failure — missing pupPage,
+    // evaluate throwing, collection unavailable, or the bounded wait — falls
+    // through to the public API.
+    const startedAt = Date.now()
+    let fromStore: CollectChatsResult | null = null
     try {
-      chats = await this.withTimeout(
-        this.getChatsFromStore(),
-        15000,
-        "window.Store.Chat.getModelsArray()",
+      fromStore = await this.withTimeout(
+        this.readChatsFromStore(),
+        30000,
+        "WhatsApp chat collection",
       )
     } catch (err) {
-      logger.warn("WhatsApp", "Store fast path failed - falling back to client.getChats()", {
+      logger.warn("WhatsApp", "Chat collection read failed - falling back", {
         error: err instanceof Error ? err.message : String(err),
       })
-      chats = null
     }
 
-    if (chats === null) {
-      return this.getChatsViaClient()
+    if (fromStore) {
+      logger.info("WhatsApp", "Chat collection read", {
+        chats: fromStore.chats.length,
+        total: fromStore.total,
+        recovered: fromStore.recovered,
+        skipped: fromStore.skipped,
+        firstError: fromStore.firstError,
+        collectionError: fromStore.collectionError,
+        ms: Date.now() - startedAt,
+      })
+      if (fromStore.chats.length > 0) {
+        return this.finalizeChats(fromStore.chats)
+      }
     }
 
-    logger.debug("WhatsApp", "Raw chats from Store", { count: chats.length })
-    return this.finalizeChats(chats)
+    return this.getChatsViaClient()
   }
 
-  private async getChatsFromStore(): Promise<ChatLike[]> {
+  private async readChatsFromStore(): Promise<CollectChatsResult> {
     const pupPage = (this.client as unknown as { pupPage?: StorePage }).pupPage
     if (!pupPage) {
       throw new Error("pupPage not available")
     }
-
-    return pupPage.evaluate(() => {
-      const store = (globalThis as unknown as { Store?: { Chat?: { getModelsArray?: () => unknown[] } } }).Store
-      if (!store?.Chat?.getModelsArray) {
-        throw new Error("Store.Chat not available")
-      }
-      const models = store.Chat.getModelsArray()
-      return models.map((c) => {
-        const chat = c as {
-          id?: { _serialized?: string }
-          name?: string
-          formattedTitle?: string
-          contact?: { pushname?: string; name?: string }
-          isGroup?: boolean
-          unreadCount?: number
-          archive?: boolean
-          archived?: boolean
-          pin?: boolean
-          isMuted?: boolean
-          muteExpiration?: number
-          mute?: { expiration?: number }
-          t?: number
-          groupMetadata?: { participants?: unknown[] }
-          lastMessage?: { body?: string; t?: number; id?: { fromMe?: boolean } }
-        }
-        return {
-          id: chat.id?._serialized || String(chat.id ?? ""),
-          name:
-            chat.name ||
-            chat.formattedTitle ||
-            chat.contact?.pushname ||
-            chat.contact?.name ||
-            "Unknown",
-          isGroup: !!chat.isGroup,
-          unreadCount: chat.unreadCount || 0,
-          archived: !!(chat.archive || chat.archived),
-          pinned: !!chat.pin,
-          isMuted: !!(chat.isMuted || (chat.muteExpiration ?? 0) > 0 || (chat.mute?.expiration ?? 0) > 0),
-          t: chat.t || 0,
-          participantCount: chat.isGroup ? chat.groupMetadata?.participants?.length || 0 : 0,
-          lastMessage: chat.lastMessage
-            ? {
-                body: chat.lastMessage.body || "",
-                timestamp: chat.lastMessage.t || 0,
-                fromMe: !!chat.lastMessage.id?.fromMe,
-              }
-            : undefined,
-        } satisfies ChatLike
-      })
-    })
+    return pupPage.evaluate(collectWhatsAppChats)
   }
 
   /**
@@ -981,7 +926,8 @@ class WhatsAppService extends BaseMessagingService {
   private formatChat(chat: ChatLike): ChatData {
     const chatId = typeof chat.id === "string" ? chat.id : chat.id?._serialized || ""
     const lastBody = chat.lastMessage?.body || ""
-    const lastTimestamp = chat.timestamp || chat.lastMessage?.timestamp || chat.t || 0
+    const lastTimestamp =
+      chat.timestamp || chat.lastMessage?.timestamp || chat.lastMessage?.t || chat.t || 0
     const lastFromMe = chat.lastMessage?.fromMe ?? !!chat.lastMessage?.id?.fromMe
 
     return {

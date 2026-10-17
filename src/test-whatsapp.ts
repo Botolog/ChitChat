@@ -6,6 +6,7 @@
 import pkg from "whatsapp-web.js"
 const { Client, LocalAuth } = pkg
 import { renderQrBlocks } from "./utils/qr"
+import { collectWhatsAppChats } from "./utils/whatsappChats"
 import { appendFileSync, writeFileSync } from "fs"
 
 const LOG_FILE = "whatsapp-test.log"
@@ -134,28 +135,29 @@ async function main() {
     // TEST: Load chats using the exact same method as the GUI
     log("INFO", "=== TESTING CHAT LOADING ===")
     try {
-      // Try direct Store access first
-      log("INFO", "Attempting direct Store.Chat access via page.evaluate()...")
+      // Read WhatsApp's collection directly, the way the app does.
+      log("INFO", "Reading WhatsApp's chat collection via collectWhatsAppChats()...")
       const pupPage = (client as any).pupPage
       if (pupPage) {
-        const directChats = await pupPage.evaluate(() => {
-          // @ts-ignore - accessing WhatsApp Web internals
-          const store = window.Store
-          if (!store || !store.Chat) {
-            return { error: "Store.Chat not available", storeKeys: store ? Object.keys(store) : [] }
-          }
-          const chats = store.Chat.getModelsArray()
-          return {
-            count: chats.length,
-            first5: chats.slice(0, 5).map((c: any) => ({
-              id: c.id?._serialized || c.id,
-              name: c.name || c.contact?.pushname || "unnamed",
-              isGroup: c.isGroup,
-              unreadCount: c.unreadCount
-            }))
-          }
+        const collected = await pupPage.evaluate(collectWhatsAppChats)
+        log("INFO", "Chat collection read result:", {
+          chats: collected.chats.length,
+          total: collected.total,
+          recovered: collected.recovered,
+          skipped: collected.skipped,
+          firstError: collected.firstError,
+          collectionError: collected.collectionError,
         })
-        log("INFO", "Direct Store access result:", directChats)
+        log("INFO", "First 5 chats from the collection:")
+        for (const chat of collected.chats.slice(0, 5)) {
+          log("INFO", "  chat:", {
+            id: chat.id,
+            name: chat.name,
+            isGroup: chat.isGroup,
+            unreadCount: chat.unreadCount,
+            lastMsgBody: chat.lastMessage?.body?.slice(0, 30) || "[none]",
+          })
+        }
       } else {
         log("WARN", "pupPage not available")
       }

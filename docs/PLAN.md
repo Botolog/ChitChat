@@ -240,6 +240,16 @@ WhatsApp field hardening (reported from a real install):
   running" (fixed in `src/utils/profileLock.ts`).
 - W7 page-state diagnostics (socket state, WhatsApp Web build, tab mutex) on
   every failed attempt, plus `--reset-whatsapp`.
+- W8 connected but **no chats listed**: `client.getChats()` maps every chat with
+  `window.WWebJS.getChatModel()` inside one `Promise.all`, so a single chat that
+  cannot be serialized rejects the whole call (WhatsApp Web 2.3000.x made that
+  common — LID group metadata throws and message keys moved `_serialized` to
+  `$1`), surfacing as an opaque `r: r` and an empty list. ChitChat now reads the
+  chat collection itself, mapping each chat independently and falling back to a
+  minimal read for the ones WhatsApp's own mapper refuses; the app also re-reads
+  the list while it is still empty, so chats appear as the local database
+  finishes restoring. See `src/utils/whatsappChats.ts` (wwebjs/whatsapp-web.js
+  #201845, fixes proposed in #201850).
 
 Media:
 - M1 path traversal in `MediaServer`; bind `127.0.0.1`.

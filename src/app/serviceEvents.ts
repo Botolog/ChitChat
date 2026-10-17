@@ -13,6 +13,51 @@ interface RegisteredHandler {
 let registeredService: MessagingService | null = null
 let registeredHandlers: RegisteredHandler[] = []
 
+/** Delays between chat-list reads while the list is still empty. */
+const EMPTY_CHAT_RETRY_DELAYS_MS = [1000, 2000, 4000, 8000, 15000]
+
+/**
+ * Read the chat list, render it, and keep re-reading while it stays empty.
+ *
+ * WhatsApp Web restores chats from its local database in the background, so a
+ * fresh login can legitimately answer with an empty list for a while. Without a
+ * retry the UI would sit on an empty list until some unrelated event arrived.
+ * Retries stop as soon as a chat shows up, and give up after a bounded wait so a
+ * genuinely empty account is not polled forever.
+ */
+async function loadChats(ctx: AppContext, svc: MessagingService, attempt = 0): Promise<void> {
+  ctx.status.set("○ Loading chats...")
+  try {
+    ctx.state.chats = await svc.getChats()
+  } catch (err) {
+    logger.error("App", "Error loading chats", err)
+    const message = err instanceof Error ? err.message : String(err)
+    ctx.status.set(`✗ ${message.slice(0, 20)}`, "#F15C6D")
+    return
+  }
+
+  logger.info("App", "Chats loaded", { count: ctx.state.chats.length, attempt })
+  renderChats(ctx)
+  updateSelection(ctx)
+
+  const delay = EMPTY_CHAT_RETRY_DELAYS_MS[attempt]
+  if (ctx.state.chats.length > 0 || delay === undefined) {
+    if (ctx.state.chats.length === 0) {
+      logger.warn("App", "Still no chats after retrying", { attempts: attempt + 1 })
+    }
+    ctx.handles.loadingText.content = ""
+    ctx.status.set("● Connected", ctx.theme.colors.primary)
+    return
+  }
+
+  setTimeout(() => {
+    // The user may have switched service (or quit) while we waited.
+    if (ctx.service.active === svc && ctx.state.isReady) {
+      void loadChats(ctx, svc, attempt + 1)
+    }
+  }, delay)
+}
+
 /** Remove only the handlers this module registered, leaving others intact. */
 export function teardownServiceEventHandlers(): void {
   if (registeredService) {
@@ -65,20 +110,7 @@ export function setupServiceEventHandlers(ctx: AppContext): void {
     logger.event("App", "ready - service is ready!")
     ctx.qr.hide()
     ctx.state.isReady = true
-    ctx.status.set("○ Loading chats...")
-
-    try {
-      ctx.state.chats = await svc.getChats()
-      logger.info("App", "Chats loaded", { count: ctx.state.chats.length })
-      renderChats(ctx)
-      updateSelection(ctx)
-      ctx.handles.loadingText.content = ""
-      ctx.status.set("● Connected", ctx.theme.colors.primary)
-    } catch (err) {
-      logger.error("App", "Error loading chats", err)
-      const message = err instanceof Error ? err.message : String(err)
-      ctx.status.set(`✗ ${message.slice(0, 20)}`, "#F15C6D")
-    }
+    await loadChats(ctx, svc)
   }
 
   const onMessage = async (): Promise<void> => {
