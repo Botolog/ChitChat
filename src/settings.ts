@@ -1,8 +1,19 @@
-import { existsSync, readFileSync, writeFileSync } from "fs"
-import { join } from "path"
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "fs"
+import { dirname, join } from "path"
 import { logger } from "./utils/logger"
 
-const SETTINGS_FILE = join(process.cwd(), ".chitchat-settings.json")
+/**
+ * Resolve the settings file location.
+ *
+ * Keeps the historical default (`<cwd>/.chitchat-settings.json`) but honours
+ * `CHITCHAT_SETTINGS_PATH` so tests / packagers can relocate it. Evaluated
+ * lazily so callers may set the env var before the first load/save.
+ */
+function getSettingsPath(): string {
+  const override = process.env.CHITCHAT_SETTINGS_PATH
+  if (override && override.trim().length > 0) return override
+  return join(process.cwd(), ".chitchat-settings.json")
+}
 
 export interface AppSettings {
   // Appearance
@@ -10,31 +21,31 @@ export interface AppSettings {
   fontSize: "small" | "medium" | "large"
   showAvatars: boolean
   compactMode: boolean
-  
+
   // Notifications
   notificationsEnabled: boolean
   notificationSound: boolean
   notificationPreview: boolean
   mutedChats: string[]
-  
+
   // Privacy
   showReadReceipts: boolean
   showTypingIndicator: boolean
   showLastSeen: boolean
-  
+
   // Chat
   enterToSend: boolean
   spellCheck: boolean
   autoDownloadMedia: "always" | "wifi" | "never"
   mediaQuality: "low" | "medium" | "high"
   confirmDeleteMessage: boolean
-  
+
   // Media Display
   mediaDisplayMode: "auto" | "indicator" | "ascii" | "kitty" | "iterm2" | "sixel" | "http"
   showMediaThumbnails: boolean
   maxThumbnailSize: number // pixels
   autoDownloadMediaOnEnter: boolean // Auto-download all media when entering chat
-  
+
   // Advanced
   developerMode: boolean
   logLevel: "debug" | "info" | "warn" | "error"
@@ -42,14 +53,14 @@ export interface AppSettings {
   connectionTimeout: number
   mouseNaturalScroll: boolean
   mouseScrollSpeed: number // Lines scrolled per wheel tick (1-10)
-  
+
   // WhatsApp Settings
   whatsapp: {
     autoMarkAsRead: boolean
     deleteOldMessages: boolean
     deleteOlderThan: number // days
   }
-  
+
   // Slack Settings
   slack: {
     showThreads: boolean
@@ -57,79 +68,222 @@ export interface AppSettings {
   }
 }
 
-const DEFAULT_SETTINGS: AppSettings = {
+export const DEFAULT_SETTINGS: AppSettings = {
   theme: "dark",
   fontSize: "medium",
   showAvatars: true,
   compactMode: false,
-  
+
   notificationsEnabled: true,
   notificationSound: true,
   notificationPreview: true,
   mutedChats: [],
-  
+
   showReadReceipts: true,
   showTypingIndicator: true,
   showLastSeen: true,
-  
+
   enterToSend: true,
   spellCheck: false,
   autoDownloadMedia: "wifi",
   mediaQuality: "medium",
   confirmDeleteMessage: true,
-  
+
   mediaDisplayMode: "auto",
   showMediaThumbnails: true,
   maxThumbnailSize: 80,
   autoDownloadMediaOnEnter: false,
-  
+
   developerMode: false,
   logLevel: "info",
   autoReconnect: true,
   connectionTimeout: 60,
   mouseNaturalScroll: true,
   mouseScrollSpeed: 3,
-  
+
   whatsapp: {
     autoMarkAsRead: true,
     deleteOldMessages: false,
     deleteOlderThan: 30,
   },
-  
+
   slack: {
     showThreads: true,
     autoExpandThreads: false,
   },
 }
 
-let currentSettings: AppSettings = { ...DEFAULT_SETTINGS }
+/**
+ * Allowed string values keyed by dotted path. Any string field listed here is
+ * treated as an enum: values outside the set fall back to the default.
+ */
+const ENUMS: Record<string, readonly string[]> = {
+  theme: ["dark", "light", "system"],
+  fontSize: ["small", "medium", "large"],
+  autoDownloadMedia: ["always", "wifi", "never"],
+  mediaQuality: ["low", "medium", "high"],
+  mediaDisplayMode: ["auto", "indicator", "ascii", "kitty", "iterm2", "sixel", "http"],
+  logLevel: ["debug", "info", "warn", "error"],
+}
+
+/**
+ * Inclusive numeric bounds keyed by dotted path. Numeric fields without an
+ * entry here only need to be finite numbers.
+ */
+const NUMBER_RANGES: Record<string, { min: number; max: number }> = {
+  maxThumbnailSize: { min: 1, max: 1024 },
+  connectionTimeout: { min: 10, max: 300 },
+  mouseScrollSpeed: { min: 1, max: 10 },
+  "whatsapp.deleteOlderThan": { min: 1, max: 365 },
+}
+
+/** Keys that must never be written into nested settings (prototype pollution). */
+const FORBIDDEN_KEYS = new Set(["__proto__", "constructor", "prototype"])
+
+/**
+ * Recursively validate `value` against the shape of `fallback` (which is always
+ * a value from `DEFAULT_SETTINGS`). Returns a freshly built value: unknown keys
+ * are dropped, wrong types are replaced per-field by the default, enums are
+ * membership-checked and numbers are range-checked.
+ */
+function validateField(path: string, value: unknown, fallback: unknown): unknown {
+  // Arrays (currently only `mutedChats: string[]`).
+  if (Array.isArray(fallback)) {
+    if (!Array.isArray(value)) return [...fallback]
+    if (fallback.every((entry) => typeof entry === "string")) {
+      return value.filter((entry): entry is string => typeof entry === "string")
+    }
+    return [...fallback]
+  }
+
+  // Nested objects (whatsapp / slack): recurse, never letting `value` inject
+  // keys that don't exist in the defaults.
+  if (fallback !== null && typeof fallback === "object") {
+    const fallbackObj = fallback as Record<string, unknown>
+    const sourceObj =
+      value !== null && typeof value === "object" && !Array.isArray(value)
+        ? (value as Record<string, unknown>)
+        : {}
+    const merged: Record<string, unknown> = {}
+    for (const key of Object.keys(fallbackObj)) {
+      const childPath = path ? `${path}.${key}` : key
+      merged[key] = validateField(childPath, sourceObj[key], fallbackObj[key])
+    }
+    return merged
+  }
+
+  if (fallback === undefined || fallback === null) return fallback
+
+  // Enumerated strings.
+  const allowed = ENUMS[path]
+  if (allowed) {
+    return typeof value === "string" && allowed.includes(value) ? value : fallback
+  }
+
+  if (typeof fallback === "boolean") {
+    return typeof value === "boolean" ? value : fallback
+  }
+
+  if (typeof fallback === "number") {
+    if (typeof value === "number" && Number.isFinite(value)) {
+      const range = NUMBER_RANGES[path]
+      if (!range || (value >= range.min && value <= range.max)) return value
+    }
+    return fallback
+  }
+
+  if (typeof fallback === "string") {
+    return typeof value === "string" ? value : fallback
+  }
+
+  return fallback
+}
+
+/** Deep clone of the defaults, guaranteed not to alias `DEFAULT_SETTINGS`. */
+function cloneDefaults(): AppSettings {
+  return validateField("", {}, DEFAULT_SETTINGS) as AppSettings
+}
+
+/**
+ * Deep-merge a parsed settings payload over the defaults with per-field
+ * validation. Never throws: a non-object payload yields the defaults.
+ */
+export function validateSettings(raw: unknown): AppSettings {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    if (raw !== undefined) {
+      logger.warn("Settings", "Settings payload is not an object; using defaults")
+    }
+    return cloneDefaults()
+  }
+  return validateField("", raw, DEFAULT_SETTINGS) as AppSettings
+}
+
+let currentSettings: AppSettings = cloneDefaults()
 
 export function loadSettings(): AppSettings {
+  const file = getSettingsPath()
   try {
-    if (existsSync(SETTINGS_FILE)) {
-      const data = readFileSync(SETTINGS_FILE, "utf-8")
-      const loaded = JSON.parse(data)
-      currentSettings = { ...DEFAULT_SETTINGS, ...loaded }
-      logger.info("Settings", "Loaded settings from file")
-    } else {
-      currentSettings = { ...DEFAULT_SETTINGS }
+    if (!existsSync(file)) {
+      currentSettings = cloneDefaults()
       logger.info("Settings", "Using default settings")
+      return currentSettings
     }
+
+    const data = readFileSync(file, "utf-8")
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(data)
+    } catch (err) {
+      logger.warn("Settings", `Corrupt settings file at ${file}; using defaults`, err)
+      currentSettings = cloneDefaults()
+      return currentSettings
+    }
+
+    currentSettings = validateSettings(parsed)
+    logger.info("Settings", "Loaded settings from file")
   } catch (err) {
-    logger.error("Settings", "Failed to load settings", err)
-    currentSettings = { ...DEFAULT_SETTINGS }
+    logger.warn("Settings", "Failed to read settings file; using defaults", err)
+    currentSettings = cloneDefaults()
   }
   return currentSettings
 }
 
+/**
+ * Atomically write `contents` to `filePath`: write a sibling temp file with
+ * `0o600`, then `rename` it over the target. Creates the parent directory when
+ * missing. Throws only to the caller; `saveSettings` converts that to `false`.
+ */
+function writeFileAtomic(filePath: string, contents: string): void {
+  const dir = dirname(filePath)
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true })
+
+  const tmpFile = `${filePath}.${process.pid}.${Date.now()}.tmp`
+  try {
+    writeFileSync(tmpFile, contents, { encoding: "utf-8", mode: 0o600 })
+    renameSync(tmpFile, filePath)
+  } catch (err) {
+    try {
+      if (existsSync(tmpFile)) rmSync(tmpFile, { force: true })
+    } catch {
+      // Best-effort cleanup; never mask the original failure.
+    }
+    throw err
+  }
+}
+
+/**
+ * Persist the given settings object. Written as-is so callers that use
+ * `setNestedSetting` at arbitrary depth are not silently pruned; input
+ * validation happens in `validateSettings` when the file is read back.
+ */
 export function saveSettings(settings: AppSettings): boolean {
   try {
-    writeFileSync(SETTINGS_FILE, JSON.stringify(settings, null, 2))
+    writeFileAtomic(getSettingsPath(), JSON.stringify(settings, null, 2))
     currentSettings = settings
     logger.info("Settings", "Saved settings to file")
     return true
   } catch (err) {
-    logger.error("Settings", "Failed to save settings", err)
+    logger.warn("Settings", "Failed to save settings", err)
     return false
   }
 }
@@ -139,34 +293,52 @@ export function getSettings(): AppSettings {
 }
 
 export function updateSetting<K extends keyof AppSettings>(key: K, value: AppSettings[K]): void {
-  currentSettings[key] = value
+  currentSettings = { ...currentSettings, [key]: value }
   saveSettings(currentSettings)
 }
 
-// Helper to get nested settings value
+/** Read a value at an arbitrary dot-separated path, or `undefined`. */
 export function getNestedSetting(key: string): any {
-  const parts = key.split('.')
+  const parts = key.split(".").filter((part) => part.length > 0)
   let value: any = currentSettings
   for (const part of parts) {
-    value = value?.[part]
+    if (FORBIDDEN_KEYS.has(part)) return undefined
+    if (value === null || typeof value !== "object") return undefined
+    value = value[part]
   }
   return value
 }
 
-// Helper to set nested settings value
+/**
+ * Write a value at an arbitrary dot-separated path, creating intermediate
+ * objects as needed. Rejects `__proto__` / `constructor` / `prototype` segments
+ * to avoid prototype pollution.
+ */
 export function setNestedSetting(key: string, value: any): void {
-  const parts = key.split('.')
-  if (parts.length === 1) {
-    updateSetting(key as keyof AppSettings, value)
-  } else {
-    // Handle nested properties like "whatsapp.autoMarkAsRead"
-    const obj: any = currentSettings
-    for (let i = 0; i < parts.length - 1; i++) {
-      if (!obj[parts[i]]) obj[parts[i]] = {}
-    }
-    obj[parts[parts.length - 2]][parts[parts.length - 1]] = value
-    saveSettings(currentSettings)
+  const parts = key.split(".").filter((part) => part.length > 0)
+  if (parts.length === 0) return
+
+  if (parts.some((part) => FORBIDDEN_KEYS.has(part))) {
+    logger.warn("Settings", `Refusing to set unsafe settings key: ${key}`)
+    return
   }
+
+  if (parts.length === 1) {
+    updateSetting(parts[0] as keyof AppSettings, value as AppSettings[keyof AppSettings])
+    return
+  }
+
+  let target = currentSettings as unknown as Record<string, unknown>
+  for (let i = 0; i < parts.length - 1; i++) {
+    const part = parts[i]
+    const next = target[part]
+    if (next === null || typeof next !== "object" || Array.isArray(next)) {
+      target[part] = {}
+    }
+    target = target[part] as Record<string, unknown>
+  }
+  target[parts[parts.length - 1]] = value
+  saveSettings(currentSettings)
 }
 
 // Settings menu structure for the TUI
@@ -269,8 +441,8 @@ const MAIN_SETTINGS: SettingSection[] = [
       { id: "clearMediaCache", label: "Clear Media Cache", type: "button" },
       { id: "clearCache", label: "Clear Cache", type: "button", action: () => { /* TODO */ } },
       { id: "exportSettings", label: "Export Settings", type: "button", action: () => { /* TODO */ } },
-      { id: "resetSettings", label: "Reset to Defaults", type: "button", action: () => { 
-        currentSettings = { ...DEFAULT_SETTINGS }
+      { id: "resetSettings", label: "Reset to Defaults", type: "button", action: () => {
+        currentSettings = cloneDefaults()
         saveSettings(currentSettings)
       }},
     ]

@@ -1,16 +1,67 @@
 import pkg from "whatsapp-web.js"
-const { Client, LocalAuth } = pkg
-import { EventEmitter } from "events"
+const { Client, LocalAuth, WAState } = pkg
 import { existsSync } from "fs"
 import { Logger } from "../utils/logger"
 import { mediaCache } from "../utils/mediaCache"
 import { renderQrBlocks } from "../utils/qr"
-import type { ChatData, ContactData, MediaAttachment, MessageData } from "./types"
+import { BaseMessagingService } from "./base"
 import type { ServiceCapabilities } from "./capabilities"
+import type {
+  ChatData,
+  ContactData,
+  MediaAttachment,
+  MessageData,
+  SendMessageOptions,
+} from "./types"
 
 export type { ChatData, ContactData, MediaAttachment, MessageData }
 
 const logger = new Logger("whatsapp.log", "WhatsApp")
+
+/** Capabilities advertised to the UI. */
+const WHATSAPP_CAPABILITIES: ServiceCapabilities = {
+  qrAuth: true,
+  deleteMessage: "both",
+  editMessage: true,
+  pin: true,
+  mute: true,
+  archive: true,
+  downloadMedia: true,
+  reply: true,
+}
+
+/**
+ * Structural view of a chat used by `formatChat`.
+ *
+ * Field names deliberately avoid the WhatsApp `Chat` class members that are
+ * methods (`pin`, `mute`, `archive`) so both `Chat` instances and the plain
+ * objects returned by the `window.Store` fast path can be normalized here.
+ */
+interface ChatLike {
+  id?: string | { _serialized?: string }
+  name?: string
+  formattedTitle?: string
+  isGroup?: boolean
+  unreadCount?: number
+  archived?: boolean
+  pinned?: boolean
+  isMuted?: boolean
+  muteExpiration?: number
+  t?: number
+  timestamp?: number
+  participantCount?: number
+  lastMessage?: {
+    body?: string
+    timestamp?: number
+    fromMe?: boolean
+    id?: { fromMe?: boolean }
+  }
+}
+
+/** Minimal Puppeteer `Page` surface used for the `window.Store` fast path. */
+interface StorePage {
+  evaluate<T>(pageFunction: () => T | Promise<T>): Promise<T>
+}
 
 /**
  * Resolve the Chromium executable Puppeteer should use.
@@ -66,18 +117,23 @@ function buildPuppeteerOptions() {
   }
 }
 
-class WhatsAppService extends EventEmitter {
+class WhatsAppService extends BaseMessagingService {
+  readonly id = "whatsapp"
+  readonly displayName = "WhatsApp"
+
   private client: pkg.Client
-  private ready = false
-  private qrCode: string | null = null
+  /** One-shot safety net used when whatsapp-web.js never emits `ready`. */
   private readyFallback: NodeJS.Timeout | null = null
+  /** Guards against double-registering client event handlers. */
+  private handlersRegistered = false
+  /** Single-flight guard for `initialize()` so retries cannot overlap. */
+  private initializePromise: Promise<void> | null = null
 
   constructor() {
     super()
     logger.info("WhatsApp", "Creating WhatsApp client")
-    const execPath = resolveExecutablePath()
-    logger.info("WhatsApp", "Puppeteer config", { 
-      executablePath: execPath,
+    logger.info("WhatsApp", "Puppeteer config", {
+      executablePath: resolveExecutablePath(),
       hasEnvVar: !!process.env.PUPPETEER_EXECUTABLE_PATH,
       cacheDir: process.env.PUPPETEER_CACHE_DIR,
     })
@@ -85,18 +141,29 @@ class WhatsAppService extends EventEmitter {
       authStrategy: new LocalAuth(),
       puppeteer: buildPuppeteerOptions(),
     })
-    logger.info("WhatsApp", "Client created, setting up event handlers")
     this.setupEventHandlers()
   }
 
-  private setupEventHandlers() {
+  override capabilities(): ServiceCapabilities {
+    return { ...WHATSAPP_CAPABILITIES }
+  }
+
+  /**
+   * Register the client event handlers exactly once per client instance.
+   *
+   * `client.initialize()` may be retried and `reconnect()` builds a new client;
+   * both paths call this again, so the flag prevents duplicate listeners that
+   * would otherwise emit duplicate `message`/`qr` events.
+   */
+  private setupEventHandlers(): void {
+    if (this.handlersRegistered) return
+    this.handlersRegistered = true
     logger.info("WhatsApp", "=== Setting up ALL event handlers ===")
 
     this.client.on("qr", (qr) => {
       logger.event("WhatsApp", "EVENT: qr received", { qrLength: qr.length })
       logger.debug("WhatsApp", "QR code first 50 chars", { preview: qr.substring(0, 50) })
-      this.qrCode = qr
-      this.emit("qr", qr)
+      this.setQr(qr)
       logger.debug("WhatsApp", "Emitted qr event to listeners")
     })
 
@@ -122,26 +189,27 @@ class WhatsAppService extends EventEmitter {
 
     this.client.on("disconnected", (reason) => {
       logger.event("WhatsApp", "EVENT: disconnected", { reason })
-      logger.warn("WhatsApp", "Setting this.ready = false due to disconnect")
+      logger.warn("WhatsApp", "Setting ready = false due to disconnect")
+      this.clearReadyFallback()
       this.ready = false
       this.emit("disconnected", reason)
     })
 
     this.client.on("message", (message) => {
-      logger.event("WhatsApp", "EVENT: message received", { 
-        id: message.id._serialized, 
+      logger.event("WhatsApp", "EVENT: message received", {
+        id: message.id._serialized,
         from: message.from,
         body: message.body?.substring(0, 30),
-        type: message.type
+        type: message.type,
       })
       this.emit("message", this.formatMessage(message))
     })
 
     this.client.on("message_create", (message) => {
-      logger.event("WhatsApp", "EVENT: message_create", { 
-        id: message.id._serialized, 
+      logger.event("WhatsApp", "EVENT: message_create", {
+        id: message.id._serialized,
         fromMe: message.fromMe,
-        to: message.to
+        to: message.to,
       })
       this.emit("message_create", this.formatMessage(message))
     })
@@ -175,25 +243,29 @@ class WhatsAppService extends EventEmitter {
       logger.event("WhatsApp", "EVENT: remote_session_saved")
     })
 
+    // Never let a provider-level "error" crash the app: Node throws on an
+    // `error` event with no listener, and the reserved name must stay unused.
+    this.client.on("error", (error) => {
+      logger.error("WhatsApp", "EVENT: client error", error)
+      this.emit("service_error", error)
+    })
+
     logger.info("WhatsApp", "=== All event handlers registered ===")
   }
 
-  private clearReadyFallback() {
+  /** Cancel the single ready fallback timer, if one is running. */
+  private clearReadyFallback(): void {
     if (this.readyFallback) {
+      this.untrack(this.readyFallback)
       clearInterval(this.readyFallback)
       this.readyFallback = null
     }
   }
 
-  /** Mark the client ready exactly once and notify listeners. */
-  private markReady(source: string) {
-    if (this.ready) return
+  /** Clear the fallback before the shared readiness transition fires. */
+  protected override markReady(source: string): void {
     this.clearReadyFallback()
-    logger.info("WhatsApp", "Setting this.ready = true", { source })
-    this.ready = true
-    this.qrCode = null
-    this.emit("ready")
-    logger.info("WhatsApp", "Emitted ready event to listeners")
+    super.markReady(source)
   }
 
   /**
@@ -204,91 +276,116 @@ class WhatsAppService extends EventEmitter {
    * "Authenticated..." forever. Poll the connection state and, once it is
    * CONNECTED (or after a bounded ~30s wait), declare the client ready so the
    * UI can proceed to load chats.
+   *
+   * Exactly one timer can exist: `readyFallback` doubles as the guard and is
+   * cleared on ready/disconnected/destroy.
    */
-  private startReadyFallback() {
+  private startReadyFallback(): void {
     if (this.ready || this.readyFallback) return
     const intervalMs = 2000
     const maxAttempts = 15 // ~30s
     let attempts = 0
-    logger.info("WhatsApp", "Starting ready fallback in case the \"ready\" event never fires")
-    this.readyFallback = setInterval(async () => {
-      attempts++
-      if (this.ready) {
-        this.clearReadyFallback()
-        return
-      }
-      try {
-        const state = await this.client.getState()
-        logger.debug("WhatsApp", "Ready fallback: client state", { state, attempts })
-        if (state === "CONNECTED") {
-          logger.warn("WhatsApp", "\"ready\" never fired but state is CONNECTED - continuing anyway")
-          this.markReady("ready fallback: state CONNECTED")
-          return
-        }
-      } catch (err: any) {
-        logger.debug("WhatsApp", "Ready fallback: getState() failed", { error: err?.message })
-      }
-      if (attempts >= maxAttempts) {
-        logger.warn("WhatsApp", "Ready fallback timed out - continuing anyway")
-        this.markReady("ready fallback: timed out")
-      }
-    }, intervalMs)
+    logger.info("WhatsApp", 'Starting ready fallback in case the "ready" event never fires')
+    this.readyFallback = this.track(
+      setInterval(() => {
+        void this.pollReadyState(++attempts, maxAttempts)
+      }, intervalMs),
+    )
   }
 
-  async initialize(maxRetries: number = 3): Promise<void> {
+  private async pollReadyState(attempts: number, maxAttempts: number): Promise<void> {
+    if (this.ready) {
+      this.clearReadyFallback()
+      return
+    }
+    try {
+      const state = await this.client.getState()
+      logger.debug("WhatsApp", "Ready fallback: client state", { state, attempts })
+      if (state === WAState.CONNECTED) {
+        logger.warn('WhatsApp', '"ready" never fired but state is CONNECTED - continuing anyway')
+        this.markReady("ready fallback: state CONNECTED")
+        return
+      }
+    } catch (err) {
+      logger.debug("WhatsApp", "Ready fallback: getState() failed", {
+        error: err instanceof Error ? err.message : String(err),
+      })
+    }
+    if (attempts >= maxAttempts) {
+      logger.warn("WhatsApp", "Ready fallback timed out - continuing anyway")
+      this.markReady("ready fallback: timed out")
+    }
+  }
+
+  override async initialize(maxRetries: number = 3): Promise<void> {
+    if (this.initializePromise) return this.initializePromise
+    this.initializePromise = this.runInitialize(maxRetries).finally(() => {
+      this.initializePromise = null
+    })
+    return this.initializePromise
+  }
+
+  private async runInitialize(maxRetries: number): Promise<void> {
     logger.info("WhatsApp", "Starting initialization", { maxRetries })
-    
+
     for (let attempt = 1; attempt <= maxRetries; attempt++) {
       logger.info("WhatsApp", `Initialization attempt ${attempt}/${maxRetries}`)
-      
       try {
         await this.initializeOnce()
         logger.info("WhatsApp", "Initialization successful!")
         return
-      } catch (err: any) {
-        logger.error("WhatsApp", `Attempt ${attempt} failed`, { error: err.message })
-        
-        if (attempt < maxRetries) {
-          const backoffMs = Math.min(1000 * Math.pow(2, attempt - 1), 30000)
-          logger.info("WhatsApp", `Retrying in ${backoffMs}ms...`)
-          await new Promise(resolve => setTimeout(resolve, backoffMs))
-        } else {
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err)
+        logger.error("WhatsApp", `Attempt ${attempt} failed`, { error: message })
+        if (attempt >= maxRetries) {
           logger.error("WhatsApp", "All initialization attempts failed")
           throw err
         }
+        const backoffMs = Math.min(1000 * Math.pow(2, attempt - 1), 30000)
+        logger.info("WhatsApp", `Retrying in ${backoffMs}ms...`)
+        await new Promise((resolve) => setTimeout(resolve, backoffMs))
       }
     }
   }
 
+  /**
+   * Single initialization attempt: start the browser and wait for the service
+   * to become ready (or authentication to fail). Listeners are always removed,
+   * so a failed/timed-out attempt leaves nothing behind and can be retried.
+   */
   private initializeOnce(): Promise<void> {
-    return new Promise((resolve, reject) => {
+    return new Promise<void>((resolve, reject) => {
+      const cleanup = () => {
+        this.removeListener("ready", readyHandler)
+        this.removeListener("auth_failure", failHandler)
+      }
       const readyHandler = () => {
         logger.info("WhatsApp", "Initialization complete - ready")
-        this.removeListener("auth_failure", failHandler)
+        cleanup()
         resolve()
       }
       const failHandler = (msg: string) => {
         logger.error("WhatsApp", "Initialization failed", { message: msg })
-        this.removeListener("ready", readyHandler)
+        cleanup()
         reject(new Error(`Authentication failed: ${msg}`))
       }
       this.once("ready", readyHandler)
       this.once("auth_failure", failHandler)
-      
+
       logger.info("WhatsApp", "Calling client.initialize()")
-      this.client.initialize().catch((err) => {
-        logger.error("WhatsApp", "client.initialize() threw error", { 
-          message: err.message, 
-          stack: err.stack,
-          name: err.name 
+      // Bounded so a browser launch that never settles fails the attempt
+      // instead of hanging the caller forever. Waiting for `ready` itself is
+      // intentionally unbounded (that is the QR-scan wait, and the ready
+      // fallback bounds it once authenticated).
+      this.withTimeout(this.client.initialize(), 180000, "client.initialize()").catch((err) => {
+        cleanup()
+        logger.error("WhatsApp", "client.initialize() threw error", {
+          message: err instanceof Error ? err.message : String(err),
+          stack: err instanceof Error ? err.stack : undefined,
         })
         reject(err)
       })
     })
-  }
-
-  isReady(): boolean {
-    return this.ready
   }
 
   getQrCode(): string | null {
@@ -306,81 +403,94 @@ class WhatsAppService extends EventEmitter {
     return renderQrBlocks(qr)
   }
 
-  async getChats(): Promise<ChatData[]> {
+  override async getChats(): Promise<ChatData[]> {
     logger.info("WhatsApp", "=== getChats() START ===", { ready: this.ready })
     if (!this.ready) {
       logger.warn("WhatsApp", "getChats() called but client not ready!")
       return []
     }
+
+    // Fast path: read WhatsApp Web's internal Store directly (the public
+    // client.getChats() can hang for a long time on newer versions). Any
+    // failure — missing pupPage, evaluate throwing, Store unavailable, or the
+    // bounded wait — falls through to the public API.
+    let chats: ChatLike[] | null = null
     try {
-      // Use direct Store access - client.getChats() hangs in newer versions
-      logger.debug("WhatsApp", "Using direct Store.Chat access...")
-      const pupPage = (this.client as any).pupPage
-      if (!pupPage) {
-        logger.error("WhatsApp", "pupPage not available!")
-        return []
-      }
-      
-      const rawChats = await pupPage.evaluate(() => {
-        // @ts-ignore - accessing WhatsApp Web internals
-        const store = window.Store
-        if (!store || !store.Chat) {
-          return { error: "Store.Chat not available" }
-        }
-        const chats = store.Chat.getModelsArray()
-        return chats.map((c: any) => ({
-          id: c.id?._serialized || String(c.id),
-          name: c.name || c.contact?.pushname || c.contact?.name || "Unknown",
-          isGroup: !!c.isGroup,
-          unreadCount: c.unreadCount || 0,
-          archived: !!c.archived,
-          pinned: !!c.pin,
-          muted: c.mute?.expiration > 0,
-          timestamp: c.t || 0,
-          lastMessageBody: c.lastReceivedKey ? "" : "", // Will get from lastMessage
-          participantCount: c.isGroup ? (c.groupMetadata?.participants?.length || 0) : 0
-        }))
-      })
-      
-      if (rawChats.error) {
-        logger.warn("WhatsApp", "Direct Store access failed - falling back to client.getChats()", { error: rawChats.error })
-        return await this.getChatsViaClient()
-      }
-      
-      logger.info("WhatsApp", "Raw chats from Store", { 
-        totalCount: rawChats.length,
-        firstThree: rawChats.slice(0, 3).map((c: any) => ({ name: c.name, id: c.id }))
-      })
-      
-      const chats = rawChats as any[]
-      
-      const filtered = chats.filter((chat) => !chat.archived)
-      logger.debug("WhatsApp", "After archive filter", { count: filtered.length })
-      
-      const formatted = filtered.map((chat) => {
-        const f = this.formatChat(chat)
-        logger.debug("WhatsApp", "Formatted chat", { name: f.name, id: f.id, unread: f.unreadCount })
-        return f
-      })
-      
-      const sorted = formatted.sort((a, b) => {
-        if (a.pinned && !b.pinned) return -1
-        if (!a.pinned && b.pinned) return 1
-        const aTime = a.lastMessage?.timestamp ?? 0
-        const bTime = b.lastMessage?.timestamp ?? 0
-        return bTime - aTime
-      })
-      
-      logger.info("WhatsApp", "=== getChats() COMPLETE ===", { 
-        finalCount: sorted.length,
-        firstChat: sorted[0]?.name,
-        lastChat: sorted[sorted.length - 1]?.name 
-      })
-      return sorted
+      chats = await this.withTimeout(
+        this.getChatsFromStore(),
+        15000,
+        "window.Store.Chat.getModelsArray()",
+      )
     } catch (err) {
-      logger.error("WhatsApp", "getChats() EXCEPTION", err)
-      return []
+      logger.warn("WhatsApp", "Store fast path failed - falling back to client.getChats()", {
+        error: err instanceof Error ? err.message : String(err),
+      })
+      chats = null
     }
+
+    if (chats === null) {
+      return this.getChatsViaClient()
+    }
+
+    logger.debug("WhatsApp", "Raw chats from Store", { count: chats.length })
+    return this.finalizeChats(chats)
+  }
+
+  private async getChatsFromStore(): Promise<ChatLike[]> {
+    const pupPage = (this.client as unknown as { pupPage?: StorePage }).pupPage
+    if (!pupPage) {
+      throw new Error("pupPage not available")
+    }
+
+    return pupPage.evaluate(() => {
+      const store = (globalThis as unknown as { Store?: { Chat?: { getModelsArray?: () => unknown[] } } }).Store
+      if (!store?.Chat?.getModelsArray) {
+        throw new Error("Store.Chat not available")
+      }
+      const models = store.Chat.getModelsArray()
+      return models.map((c) => {
+        const chat = c as {
+          id?: { _serialized?: string }
+          name?: string
+          formattedTitle?: string
+          contact?: { pushname?: string; name?: string }
+          isGroup?: boolean
+          unreadCount?: number
+          archive?: boolean
+          archived?: boolean
+          pin?: boolean
+          isMuted?: boolean
+          muteExpiration?: number
+          mute?: { expiration?: number }
+          t?: number
+          groupMetadata?: { participants?: unknown[] }
+          lastMessage?: { body?: string; t?: number; id?: { fromMe?: boolean } }
+        }
+        return {
+          id: chat.id?._serialized || String(chat.id ?? ""),
+          name:
+            chat.name ||
+            chat.formattedTitle ||
+            chat.contact?.pushname ||
+            chat.contact?.name ||
+            "Unknown",
+          isGroup: !!chat.isGroup,
+          unreadCount: chat.unreadCount || 0,
+          archived: !!(chat.archive || chat.archived),
+          pinned: !!chat.pin,
+          isMuted: !!(chat.isMuted || (chat.muteExpiration ?? 0) > 0 || (chat.mute?.expiration ?? 0) > 0),
+          t: chat.t || 0,
+          participantCount: chat.isGroup ? chat.groupMetadata?.participants?.length || 0 : 0,
+          lastMessage: chat.lastMessage
+            ? {
+                body: chat.lastMessage.body || "",
+                timestamp: chat.lastMessage.t || 0,
+                fromMe: !!chat.lastMessage.id?.fromMe,
+              }
+            : undefined,
+        } satisfies ChatLike
+      })
+    })
   }
 
   /**
@@ -390,40 +500,28 @@ class WhatsAppService extends EventEmitter {
    */
   private async getChatsViaClient(): Promise<ChatData[]> {
     try {
-      const timeout = new Promise<never>((_, reject) =>
-        setTimeout(() => reject(new Error("client.getChats() timed out after 30s")), 30000)
-      )
-      const raw = (await Promise.race([this.client.getChats(), timeout])) as any[]
+      const raw = await this.withTimeout(this.client.getChats(), 30000, "client.getChats()")
       logger.info("WhatsApp", "client.getChats() returned chats", { count: raw.length })
-
-      const normalized = raw.map((c: any) => ({
-        id: c.id?._serialized || String(c.id),
-        name: c.name || c.lastMessage?.body || "Unknown",
-        isGroup: !!c.isGroup,
-        unreadCount: c.unreadCount || 0,
-        archived: !!c.archived,
-        pinned: !!c.pinned,
-        muted: !!c.isMuted,
-        timestamp: c.timestamp || c.lastMessage?.timestamp || 0,
-        lastMessageBody: c.lastMessage?.body || "",
-        participantCount: c.isGroup ? (c.groupMetadata?.participants?.length || 0) : 0,
-      }))
-
-      return normalized
-        .filter((chat) => !chat.archived)
-        .map((chat) => this.formatChat(chat))
-        .sort((a, b) => {
-          if (a.pinned && !b.pinned) return -1
-          if (!a.pinned && b.pinned) return 1
-          return (b.lastMessage?.timestamp ?? 0) - (a.lastMessage?.timestamp ?? 0)
-        })
+      return this.finalizeChats(raw)
     } catch (err) {
       logger.error("WhatsApp", "getChatsViaClient() failed", err)
       return []
     }
   }
 
-  async getMessages(chatId: string, limit: number = 50): Promise<MessageData[]> {
+  /** Normalize, filter archived chats out and sort pinned-first then newest. */
+  private finalizeChats(raw: ChatLike[]): ChatData[] {
+    return raw
+      .filter((chat) => !chat.archived)
+      .map((chat) => this.formatChat(chat))
+      .sort((a, b) => {
+        if (a.pinned && !b.pinned) return -1
+        if (!a.pinned && b.pinned) return 1
+        return (b.lastMessage?.timestamp ?? 0) - (a.lastMessage?.timestamp ?? 0)
+      })
+  }
+
+  override async getMessages(chatId: string, limit: number = 50): Promise<MessageData[]> {
     logger.debug("WhatsApp", "getMessages() called", { chatId, limit, ready: this.ready })
     if (!this.ready) {
       logger.warn("WhatsApp", "getMessages() called but not ready")
@@ -440,26 +538,39 @@ class WhatsAppService extends EventEmitter {
     }
   }
 
-  async sendMessage(chatId: string, content: string, options?: { replyTo?: string }): Promise<MessageData | null> {
-    logger.info("WhatsApp", "sendMessage() called", { chatId, contentLength: content.length, replyTo: options?.replyTo })
+  override async sendMessage(
+    chatId: string,
+    content: string,
+    options?: SendMessageOptions,
+  ): Promise<MessageData | null> {
+    logger.info("WhatsApp", "sendMessage() called", {
+      chatId,
+      contentLength: content.length,
+      replyTo: options?.replyTo,
+    })
     if (!this.ready) {
       logger.warn("WhatsApp", "sendMessage() called but not ready")
       return null
     }
     try {
       const chat = await this.client.getChatById(chatId)
-      
+
       // If replying to a message, fetch the quoted message
       let message
       if (options?.replyTo) {
         try {
           const messages = await chat.fetchMessages({ limit: 100 })
-          const quotedMsg = messages.find(m => m.id._serialized === options.replyTo)
+          const quotedMsg = messages.find((m) => m.id._serialized === options.replyTo)
           if (quotedMsg) {
             message = await quotedMsg.reply(content)
-            logger.info("WhatsApp", "Reply sent", { messageId: message.id._serialized, quotedMsgId: options.replyTo })
+            logger.info("WhatsApp", "Reply sent", {
+              messageId: message.id._serialized,
+              quotedMsgId: options.replyTo,
+            })
           } else {
-            logger.warn("WhatsApp", "Quoted message not found, sending normal message", { quotedMsgId: options.replyTo })
+            logger.warn("WhatsApp", "Quoted message not found, sending normal message", {
+              quotedMsgId: options.replyTo,
+            })
             message = await chat.sendMessage(content)
           }
         } catch (err) {
@@ -469,7 +580,7 @@ class WhatsAppService extends EventEmitter {
       } else {
         message = await chat.sendMessage(content)
       }
-      
+
       logger.info("WhatsApp", "Message sent", { messageId: message.id._serialized })
       return this.formatMessage(message)
     } catch (err) {
@@ -478,6 +589,13 @@ class WhatsAppService extends EventEmitter {
     }
   }
 
+  /**
+   * Delete a message.
+   *
+   * whatsapp-web.js `Message.delete(everyone)` revokes the message for everyone
+   * when `everyone` is true and deletes it locally (for me) when false, so the
+   * `forMe` flag is inverted before being passed through.
+   */
   async deleteMessage(messageId: string, chatId: string, forMe: boolean): Promise<boolean> {
     logger.info("WhatsApp", "deleteMessage() called", { messageId, chatId, forMe })
     if (!this.ready) {
@@ -487,22 +605,20 @@ class WhatsAppService extends EventEmitter {
     try {
       const chat = await this.client.getChatById(chatId)
       const messages = await chat.fetchMessages({ limit: 100 })
-      const message = messages.find(m => m.id._serialized === messageId)
-      
+      const message = messages.find((m) => m.id._serialized === messageId)
+
       if (!message) {
         logger.warn("WhatsApp", "Message not found for deletion", { messageId })
         return false
       }
-      
-      // Delete for everyone or just for me
-      if (forMe) {
-        await message.delete(true) // true = delete for me only
-        logger.info("WhatsApp", "Message deleted for me", { messageId })
-      } else {
-        await message.delete(false) // false = delete for everyone
-        logger.info("WhatsApp", "Message deleted for everyone", { messageId })
-      }
-      
+
+      // forMe=true  -> delete(false) -> local delete (for me)
+      // forMe=false -> delete(true)  -> revoke (for everyone)
+      await message.delete(!forMe)
+      logger.info("WhatsApp", forMe ? "Message deleted for me" : "Message deleted for everyone", {
+        messageId,
+      })
+
       return true
     } catch (err) {
       logger.error("WhatsApp", "deleteMessage() error", err)
@@ -511,7 +627,11 @@ class WhatsAppService extends EventEmitter {
   }
 
   async editMessage(messageId: string, chatId: string, newText: string): Promise<boolean> {
-    logger.info("WhatsApp", "editMessage() called", { messageId, chatId, newTextLength: newText.length })
+    logger.info("WhatsApp", "editMessage() called", {
+      messageId,
+      chatId,
+      newTextLength: newText.length,
+    })
     if (!this.ready) {
       logger.warn("WhatsApp", "editMessage() called but not ready")
       return false
@@ -519,23 +639,22 @@ class WhatsAppService extends EventEmitter {
     try {
       const chat = await this.client.getChatById(chatId)
       const messages = await chat.fetchMessages({ limit: 100 })
-      const message = messages.find(m => m.id._serialized === messageId)
-      
+      const message = messages.find((m) => m.id._serialized === messageId)
+
       if (!message) {
         logger.warn("WhatsApp", "Message not found for editing", { messageId })
         return false
       }
-      
+
       // Check if message is from me
       if (!message.fromMe) {
         logger.warn("WhatsApp", "Cannot edit message not from me", { messageId })
         return false
       }
-      
-      // Edit the message
+
       await message.edit(newText)
       logger.info("WhatsApp", "Message edited successfully", { messageId })
-      
+
       return true
     } catch (err) {
       logger.error("WhatsApp", "editMessage() error", err)
@@ -543,7 +662,7 @@ class WhatsAppService extends EventEmitter {
     }
   }
 
-  async markAsRead(chatId: string): Promise<void> {
+  override async markAsRead(chatId: string): Promise<void> {
     logger.debug("WhatsApp", "markAsRead() called", { chatId })
     if (!this.ready) return
     try {
@@ -609,7 +728,7 @@ class WhatsAppService extends EventEmitter {
     }
   }
 
-  async getContactInfo(contactId: string): Promise<ContactData | null> {
+  override async getContactInfo(contactId: string): Promise<ContactData | null> {
     if (!this.ready) return null
     try {
       const contact = await this.client.getContactById(contactId)
@@ -626,85 +745,78 @@ class WhatsAppService extends EventEmitter {
     }
   }
 
-  private formatChat(chat: any): ChatData {
-    // Handle both whatsapp-web.js Chat objects and plain Store objects
-    const chatId = chat.id?._serialized || chat.id
-    const chatName = chat.name || "Unknown"
-    
-    logger.debug("WhatsApp", "formatChat() called", { 
-      chatId, 
-      chatName,
-      isGroup: chat.isGroup,
-      unreadCount: chat.unreadCount
-    })
-    
-    const formatted: ChatData = {
+  private formatChat(chat: ChatLike): ChatData {
+    const chatId = typeof chat.id === "string" ? chat.id : chat.id?._serialized || ""
+    const lastBody = chat.lastMessage?.body || ""
+    const lastTimestamp = chat.timestamp || chat.lastMessage?.timestamp || chat.t || 0
+    const lastFromMe = chat.lastMessage?.fromMe ?? !!chat.lastMessage?.id?.fromMe
+
+    return {
       id: chatId,
-      name: chatName,
+      name: chat.name || chat.formattedTitle || "Unknown",
       isGroup: !!chat.isGroup,
       unreadCount: chat.unreadCount || 0,
-      pinned: !!chat.pinned || !!chat.pin,
-      muted: !!chat.muted || !!chat.isMuted,
+      pinned: !!chat.pinned,
+      muted: !!(chat.isMuted || (chat.muteExpiration ?? 0) > 0),
       archived: !!chat.archived,
       participantCount: chat.participantCount,
-      lastMessage: chat.timestamp
+      lastMessage: lastTimestamp
         ? {
-            body: chat.lastMessageBody || "",
-            timestamp: chat.timestamp,
-            fromMe: false,
+            body: lastBody,
+            timestamp: lastTimestamp,
+            fromMe: lastFromMe,
           }
         : undefined,
     }
-    logger.debug("WhatsApp", "formatChat() complete", { name: formatted.name, id: formatted.id })
-    return formatted
   }
 
   private formatMessage(message: pkg.Message): MessageData {
-    logger.debug("WhatsApp", "formatMessage() called", { 
-      id: message.id._serialized, 
-      fromMe: message.fromMe, 
+    const msgAny = message as unknown as {
+      _data?: {
+        filename?: string
+        size?: number
+        quotedMsg?: { id?: { _serialized?: string }; body?: string }
+        quotedStanzaID?: string
+      }
+      filename?: string
+      mimetype?: string
+      filesize?: number
+      isForwarded?: boolean
+      forwardingScore?: number
+      isStarred?: boolean
+      hasQuotedMsg?: boolean
+      quotedMsgId?: string
+    }
+
+    logger.debug("WhatsApp", "formatMessage() called", {
+      id: message.id._serialized,
+      fromMe: message.fromMe,
       type: message.type,
-      hasMedia: message.hasMedia
+      hasMedia: message.hasMedia,
     })
-    const msgAny = message as any
-    
+
     // Extract media info if present
     let media: MediaAttachment | undefined
     if (message.hasMedia) {
       const mediaType = this.getMediaType(message.type)
-      const filename = msgAny._data?.filename || msgAny.filename || 'media'
-      
+      const filename = msgAny._data?.filename || msgAny.filename || "media"
+
       media = {
         type: mediaType,
-        mimetype: msgAny.mimetype || 'application/octet-stream',
-        filename: filename,
+        mimetype: msgAny.mimetype || "application/octet-stream",
+        filename,
         filesize: msgAny.filesize || msgAny._data?.size,
         // Media bytes are fetched lazily from this message id.
         messageId: message.id._serialized,
       }
-      logger.debug("WhatsApp", "Message has media", { 
-        type: mediaType, 
-        mimetype: media.mimetype,
-        filename: media.filename
-      })
     }
-    
-    // Debug quoted message extraction
-    if (msgAny.hasQuotedMsg) {
-      logger.info("WhatsApp", "Message has quoted msg", {
-        hasQuotedMsg: msgAny.hasQuotedMsg,
-        quotedMsgData: !!msgAny._data?.quotedMsg,
-        quotedMsgId_path1: msgAny._data?.quotedMsg?.id?._serialized,
-        quotedMsgId_path2: msgAny._data?.quotedStanzaID,
-        quotedMsgBody: msgAny._data?.quotedMsg?.body?.slice(0, 30),
-      })
-    }
-    
+
     // Try multiple paths for quotedMsgId since WhatsApp structure varies
-    const quotedMsgId = msgAny._data?.quotedMsg?.id?._serialized || 
-                        msgAny._data?.quotedStanzaID ||
-                        msgAny.quotedMsgId
-    
+    const quotedMsgId =
+      msgAny._data?.quotedMsg?.id?._serialized ||
+      msgAny._data?.quotedStanzaID ||
+      msgAny.quotedMsgId
+
     return {
       id: message.id._serialized,
       body: message.body || "",
@@ -719,17 +831,17 @@ class WhatsAppService extends EventEmitter {
       isStarred: msgAny.isStarred || false,
       hasQuotedMsg: msgAny.hasQuotedMsg || false,
       quotedMsgBody: msgAny._data?.quotedMsg?.body,
-      quotedMsgId: quotedMsgId,
+      quotedMsgId,
       media,
     }
   }
 
-  private getMediaType(messageType: string): MediaAttachment['type'] {
-    if (messageType.includes('image')) return 'image'
-    if (messageType.includes('video')) return 'video'
-    if (messageType.includes('audio') || messageType.includes('ptt')) return 'audio'
-    if (messageType.includes('sticker')) return 'sticker'
-    return 'document'
+  private getMediaType(messageType: string): MediaAttachment["type"] {
+    if (messageType.includes("image")) return "image"
+    if (messageType.includes("video")) return "video"
+    if (messageType.includes("audio") || messageType.includes("ptt")) return "audio"
+    if (messageType.includes("sticker")) return "sticker"
+    return "document"
   }
 
   async downloadMedia(messageId: string, chatId: string): Promise<string | null> {
@@ -744,27 +856,22 @@ class WhatsAppService extends EventEmitter {
       const chat = await this.client.getChatById(chatId)
       const chatName = chat.name || chatId
       const messages = await chat.fetchMessages({ limit: 100 })
-      const waMessage = messages.find((m: any) => m.id._serialized === messageId)
-      
+      const waMessage = messages.find((m) => m.id._serialized === messageId)
+
       if (!waMessage || !waMessage.hasMedia) {
         logger.warn("WhatsApp", "Message not found or has no media", { messageId })
         return null
       }
 
-      const msgAny = waMessage as any
-      const filename = msgAny._data?.filename || msgAny.filename || 'media'
-      // Use MESSAGE timestamp, not current time!
+      const msgAny = waMessage as unknown as { _data?: { filename?: string }; filename?: string; mimetype?: string }
+      const filename = msgAny._data?.filename || msgAny.filename || "media"
+      // Use the MESSAGE timestamp, not current time!
       const timestamp = waMessage.timestamp
-      const mimetype = msgAny.mimetype || 'application/octet-stream'
-      
-      logger.info("WhatsApp", "Media info extracted", { 
-        filename, 
-        timestamp, 
-        messageDate: new Date(timestamp * 1000).toISOString()
-      })
-      
-      // Check cache first
-      const cached = mediaCache.get(chatName, filename, timestamp, mimetype)
+      const mimetype = msgAny.mimetype || "application/octet-stream"
+
+      // Check cache first (`await` keeps this working whether the cache API is
+      // synchronous or promise-based).
+      const cached = await mediaCache.get(chatName, filename, timestamp, mimetype)
       if (cached) {
         logger.info("WhatsApp", "Media found in cache", { messageId, cached })
         return cached
@@ -772,23 +879,23 @@ class WhatsAppService extends EventEmitter {
 
       logger.info("WhatsApp", "Downloading media...")
       const media = await waMessage.downloadMedia()
-      
+
       if (!media) {
         logger.error("WhatsApp", "Failed to download media")
         return null
       }
 
       // Cache the media with chatname+filename+timestamp hash
-      const buffer = Buffer.from(media.data, 'base64')
+      const buffer = Buffer.from(media.data, "base64")
       const filePath = await mediaCache.cache(chatName, filename, timestamp, buffer, media.mimetype)
-      
-      logger.info("WhatsApp", "Media downloaded and cached", { 
+
+      logger.info("WhatsApp", "Media downloaded and cached", {
         messageId,
         chatName,
         filename,
         filePath,
         size: buffer.length,
-        mimetype: media.mimetype
+        mimetype: media.mimetype,
       })
 
       return filePath
@@ -798,30 +905,19 @@ class WhatsAppService extends EventEmitter {
     }
   }
 
-  async destroy(): Promise<void> {
-    logger.info("WhatsApp", "Destroying client")
-    try {
-      await this.client.destroy()
-      this.ready = false
-      logger.info("WhatsApp", "Client destroyed")
-    } catch (err) {
-      logger.error("WhatsApp", "Error destroying client", err)
-    }
-  }
-
   async reconnect(): Promise<void> {
     logger.info("WhatsApp", "Attempting to reconnect...")
     try {
       await this.destroy()
       logger.info("WhatsApp", "Client destroyed, waiting before reconnect...")
-      await new Promise(resolve => setTimeout(resolve, 2000))
-      
-      // Recreate client
+      await new Promise((resolve) => setTimeout(resolve, 2000))
+
+      // Recreate client and re-register handlers for the new instance
       this.client = new Client({
         authStrategy: new LocalAuth(),
         puppeteer: buildPuppeteerOptions(),
       })
-      
+      this.handlersRegistered = false
       this.setupEventHandlers()
       await this.initialize()
       logger.info("WhatsApp", "Reconnection successful!")
@@ -831,10 +927,20 @@ class WhatsAppService extends EventEmitter {
     }
   }
 
-  getConnectionState(): { ready: boolean; hasQr: boolean } {
-    return {
-      ready: this.ready,
-      hasQr: this.qrCode !== null
+  protected override async teardown(): Promise<void> {
+    logger.info("WhatsApp", "Destroying client")
+    this.clearReadyFallback()
+    this.ready = false
+    this.qrCode = null
+    // Drop every provider listener so the destroyed client cannot call back
+    // into this service (and so `reconnect()` starts from a clean slate).
+    this.client.removeAllListeners()
+    this.handlersRegistered = false
+    try {
+      await this.client.destroy()
+      logger.info("WhatsApp", "Client destroyed")
+    } catch (err) {
+      logger.error("WhatsApp", "Error destroying client", err)
     }
   }
 }

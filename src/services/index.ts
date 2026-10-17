@@ -14,13 +14,24 @@ export type {
 } from "./types"
 export type { ServiceCapabilities } from "./capabilities"
 
-// Service instances cache
+/** Service instances cache, keyed by service id. */
 const serviceInstances: Map<string, MessagingService> = new Map()
 
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
+}
+
+/**
+ * Load (or return the cached) service instance for `serviceId`.
+ *
+ * Returns `null` for unknown or not-yet-implemented services instead of
+ * throwing, so the UI can surface a friendly message.
+ */
 export async function getServiceInstance(serviceId: string): Promise<MessagingService | null> {
   // Return cached instance if exists
-  if (serviceInstances.has(serviceId)) {
-    return serviceInstances.get(serviceId)!
+  const cached = serviceInstances.get(serviceId)
+  if (cached) {
+    return cached
   }
 
   logger.info("ServiceManager", "Loading service", { serviceId })
@@ -31,12 +42,12 @@ export async function getServiceInstance(serviceId: string): Promise<MessagingSe
     switch (serviceId) {
       case "whatsapp": {
         const { whatsapp } = await import("./whatsapp")
-        service = whatsapp as unknown as MessagingService
+        service = whatsapp
         break
       }
       case "slack": {
         const { slack } = await import("./slack")
-        service = slack as unknown as MessagingService
+        service = slack
         break
       }
       case "discord":
@@ -50,20 +61,20 @@ export async function getServiceInstance(serviceId: string): Promise<MessagingSe
         return null
     }
 
-    if (service) {
-      serviceInstances.set(serviceId, service)
-      logger.info("ServiceManager", "Service loaded", { serviceId })
-    }
-
+    serviceInstances.set(serviceId, service)
+    logger.info("ServiceManager", "Service loaded", { serviceId })
     return service
-  } catch (err: any) {
-    logger.error("ServiceManager", "Failed to load service", { serviceId, error: err.message })
+  } catch (err) {
+    logger.error("ServiceManager", "Failed to load service", {
+      serviceId,
+      error: errorMessage(err),
+    })
     return null
   }
 }
 
 export function getCachedService(serviceId: string): MessagingService | null {
-  return serviceInstances.get(serviceId) || null
+  return serviceInstances.get(serviceId) ?? null
 }
 
 export async function destroyService(serviceId: string): Promise<void> {
@@ -80,8 +91,11 @@ export async function destroyAllServices(): Promise<void> {
     try {
       await service.destroy()
       logger.info("ServiceManager", "Service destroyed", { serviceId: id })
-    } catch (err: any) {
-      logger.error("ServiceManager", "Error destroying service", { serviceId: id, error: err.message })
+    } catch (err) {
+      logger.error("ServiceManager", "Error destroying service", {
+        serviceId: id,
+        error: errorMessage(err),
+      })
     }
   }
   serviceInstances.clear()
