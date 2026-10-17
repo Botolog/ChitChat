@@ -250,6 +250,21 @@ WhatsApp field hardening (reported from a real install):
   the list while it is still empty, so chats appear as the local database
   finishes restoring. See `src/utils/whatsappChats.ts` (wwebjs/whatsapp-web.js
   #201845, fixes proposed in #201850).
+- W9 chats listed but **every action fails** with `r: r`
+  (`getChatById` → `getChatModel` → `Msg.get(undefined)`, and message ids coming
+  back without `_serialized`). Reading messages, sending, replying, deleting,
+  editing, marking read, pinning and media all go through the library's model
+  mapping. ChitChat now installs a small runtime compatibility layer
+  (`src/utils/whatsappCompat.ts`) once the library has injected `window.WWebJS`:
+  it aliases the renamed message-key field (`$1` → `_serialized`) on the key class
+  and on serialized ids, makes `getMessageModel`/`getChatModel` degrade to a
+  minimal plain model instead of throwing, isolates `getChats` per chat, and adds
+  the `getMsgKeyId` helper the upstream patch introduces. It is version-tolerant —
+  every wrapper tries the original implementation first — and its counters (plus
+  which patches applied) are written into the page-state dump. The service also
+  stopped resolving chats for actions that only need an id (`sendSeen`, `pinChat`,
+  `muteChat`, `archiveChat`, `getMessageById`) and reads message ids through one
+  tolerant helper.
 
 Media:
 - M1 path traversal in `MediaServer`; bind `127.0.0.1`.

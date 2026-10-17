@@ -55,9 +55,16 @@ src/
     terminalCapabilities.ts Kitty/iTerm2/Sixel/colour detection + getOptimalDisplayMode()
     qr.ts                   renderQrBlocks(): QR payload -> block-character string
     text.ts                 truncate / formatDate / formatFileSize helpers
+    paths.ts                resolveDataPath/resolveLogPath (CHITCHAT_DATA_DIR/LOG_DIR)
     mediaCache.ts           on-disk + in-memory media cache
     mediaRenderer.ts        renders MediaAttachment for the terminal
     mediaServer.ts          loopback HTTP gallery/file server
+    profileLock.ts          Chromium SingletonLock recovery + ProfileLockedError
+    whatsappTabState.ts     clears WhatsApp Web's cross-window tab mutex before boot
+    whatsappChats.ts        in-page chat reader that never lets one bad chat hide the list
+    whatsappCompat.ts       runtime shim for the WhatsApp Web build whatsapp-web.js
+                            does not support (message-key `$1` rename, throwing
+                            model mappers) — installed once WWebJS is injected
   test-whatsapp.ts   standalone WhatsApp/Puppeteer smoke script (`bun run test:whatsapp`)
 ```
 

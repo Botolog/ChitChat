@@ -13,6 +13,7 @@ import {
   type CollectChatsResult,
   type WhatsAppChatModel,
 } from "../utils/whatsappChats"
+import { installWhatsAppCompat } from "../utils/whatsappCompat"
 import { BaseMessagingService } from "./base"
 import type { ServiceCapabilities } from "./capabilities"
 import type {
@@ -209,7 +210,10 @@ class WhatsAppService extends BaseMessagingService {
     this.client.on("ready", () => {
       logger.event("WhatsApp", "EVENT: ready - WhatsApp client is fully ready!")
       void this.logWWebVersion()
-      this.markReady("client ready event")
+      // Whatever the UI does next (messages, sending, media) goes through
+      // whatsapp-web.js' own API, so the compatibility layer has to be in place
+      // before the app is told it may start.
+      void this.ensureCompat().finally(() => this.markReady("client ready event"))
     })
 
     this.client.on("authenticated", () => {
@@ -237,7 +241,7 @@ class WhatsAppService extends BaseMessagingService {
 
     this.client.on("message", (message) => {
       logger.event("WhatsApp", "EVENT: message received", {
-        id: message.id._serialized,
+        id: this.messageIdOf(message),
         from: message.from,
         body: message.body?.substring(0, 30),
         type: message.type,
@@ -247,7 +251,7 @@ class WhatsAppService extends BaseMessagingService {
 
     this.client.on("message_create", (message) => {
       logger.event("WhatsApp", "EVENT: message_create", {
-        id: message.id._serialized,
+        id: this.messageIdOf(message),
         fromMe: message.fromMe,
         to: message.to,
       })
@@ -255,8 +259,9 @@ class WhatsAppService extends BaseMessagingService {
     })
 
     this.client.on("message_ack", (message, ack) => {
-      logger.event("WhatsApp", "EVENT: message_ack", { id: message.id._serialized, ack })
-      this.emit("message_ack", { id: message.id._serialized, ack })
+      const id = this.messageIdOf(message)
+      logger.event("WhatsApp", "EVENT: message_ack", { id, ack })
+      this.emit("message_ack", { id, ack })
     })
 
     // Typing indicator
@@ -343,6 +348,7 @@ class WhatsAppService extends BaseMessagingService {
       logger.debug("WhatsApp", "Ready fallback: client state", { state, attempts })
       if (state === WAState.CONNECTED) {
         logger.warn('WhatsApp', '"ready" never fired but state is CONNECTED - continuing anyway')
+        await this.ensureCompat()
         this.markReady("ready fallback: state CONNECTED")
         return
       }
@@ -353,7 +359,46 @@ class WhatsAppService extends BaseMessagingService {
     }
     if (attempts >= maxAttempts) {
       logger.warn("WhatsApp", "Ready fallback timed out - continuing anyway")
+      await this.ensureCompat()
       this.markReady("ready fallback: timed out")
+    }
+  }
+
+  /**
+   * Install the WhatsApp Web compatibility layer ({@link installWhatsAppCompat})
+   * and log what it did.
+   *
+   * whatsapp-web.js only defines `window.WWebJS` once it has injected itself, so
+   * this is best-effort: it runs again on every readiness path until it takes.
+   * Never throws — a page that cannot be reached must not stop the client from
+   * becoming ready.
+   */
+  private async ensureCompat(): Promise<void> {
+    const page = (
+      this.client as unknown as {
+        pupPage?: { evaluate: <T>(fn: () => T) => Promise<T> }
+      }
+    ).pupPage
+    if (!page) return
+    try {
+      const report = await this.withTimeout(
+        page.evaluate(installWhatsAppCompat),
+        10000,
+        "installWhatsAppCompat()",
+      )
+      if (!report.available) {
+        logger.debug("WhatsApp", "Compatibility layer: window.WWebJS not injected yet")
+        return
+      }
+      if (report.alreadyInstalled) return
+      logger.info("WhatsApp", "Installed WhatsApp Web compatibility layer", {
+        patches: report.patches,
+        wwebVersion: report.wwebVersion,
+      })
+    } catch (err) {
+      logger.warn("WhatsApp", "Could not install compatibility layer", {
+        error: err instanceof Error ? err.message : String(err),
+      })
     }
   }
 
@@ -568,6 +613,10 @@ class WhatsAppService extends BaseMessagingService {
             hasSynced: socket?.hasSynced ?? null,
             tabMutex,
             noTakeover,
+            // What the compatibility layer (utils/whatsappCompat) had to patch,
+            // and how often its fallbacks fired — a bare `r: r` in the log says
+            // nothing, these counters say which WhatsApp internals moved.
+            compat: g.__chitchatCompat ?? null,
             bodyText: String(g.document?.body?.innerText ?? "")
               .replace(/\s+/g, " ")
               .slice(0, 400),
@@ -731,35 +780,20 @@ class WhatsAppService extends BaseMessagingService {
       return null
     }
     try {
-      const chat = await this.client.getChatById(chatId)
-
-      // If replying to a message, fetch the quoted message
-      let message
-      if (options?.replyTo) {
-        try {
-          const messages = await chat.fetchMessages({ limit: 100 })
-          const quotedMsg = messages.find((m) => m.id._serialized === options.replyTo)
-          if (quotedMsg) {
-            message = await quotedMsg.reply(content)
-            logger.info("WhatsApp", "Reply sent", {
-              messageId: message.id._serialized,
-              quotedMsgId: options.replyTo,
-            })
-          } else {
-            logger.warn("WhatsApp", "Quoted message not found, sending normal message", {
-              quotedMsgId: options.replyTo,
-            })
-            message = await chat.sendMessage(content)
-          }
-        } catch (err) {
-          logger.error("WhatsApp", "Error sending reply, falling back to normal message", err)
-          message = await chat.sendMessage(content)
-        }
-      } else {
-        message = await chat.sendMessage(content)
+      // Replying is handled by whatsapp-web.js itself: passing the quoted
+      // message id sends the reply as a quote in one round trip, instead of
+      // fetching the history to find the message first.
+      const message = await this.client.sendMessage(
+        chatId,
+        content,
+        options?.replyTo ? { quotedMessageId: options.replyTo } : undefined,
+      )
+      if (!message) {
+        logger.error("WhatsApp", "sendMessage() returned no message", { chatId })
+        return null
       }
 
-      logger.info("WhatsApp", "Message sent", { messageId: message.id._serialized })
+      logger.info("WhatsApp", "Message sent", { messageId: this.messageIdOf(message) })
       return this.formatMessage(message)
     } catch (err) {
       logger.error("WhatsApp", "sendMessage() error", err)
@@ -781,10 +815,7 @@ class WhatsAppService extends BaseMessagingService {
       return false
     }
     try {
-      const chat = await this.client.getChatById(chatId)
-      const messages = await chat.fetchMessages({ limit: 100 })
-      const message = messages.find((m) => m.id._serialized === messageId)
-
+      const message = await this.client.getMessageById(messageId)
       if (!message) {
         logger.warn("WhatsApp", "Message not found for deletion", { messageId })
         return false
@@ -815,10 +846,7 @@ class WhatsAppService extends BaseMessagingService {
       return false
     }
     try {
-      const chat = await this.client.getChatById(chatId)
-      const messages = await chat.fetchMessages({ limit: 100 })
-      const message = messages.find((m) => m.id._serialized === messageId)
-
+      const message = await this.client.getMessageById(messageId)
       if (!message) {
         logger.warn("WhatsApp", "Message not found for editing", { messageId })
         return false
@@ -844,8 +872,9 @@ class WhatsAppService extends BaseMessagingService {
     logger.debug("WhatsApp", "markAsRead() called", { chatId })
     if (!this.ready) return
     try {
-      const chat = await this.client.getChatById(chatId)
-      await chat.sendSeen()
+      // `client.sendSeen(chatId)` works off WhatsApp's own chat model, so it is
+      // unaffected by the library's model mapping (see utils/whatsappCompat).
+      await this.client.sendSeen(chatId)
       logger.debug("WhatsApp", "Marked as read", { chatId })
     } catch (err) {
       logger.error("WhatsApp", "markAsRead() error", err)
@@ -856,11 +885,10 @@ class WhatsAppService extends BaseMessagingService {
     logger.info("WhatsApp", "pinChat() called", { chatId, pin })
     if (!this.ready) return false
     try {
-      const chat = await this.client.getChatById(chatId)
       if (pin) {
-        await chat.pin()
+        await this.client.pinChat(chatId)
       } else {
-        await chat.unpin()
+        await this.client.unpinChat(chatId)
       }
       logger.info("WhatsApp", "Chat pin toggled", { chatId, pin })
       return true
@@ -874,11 +902,10 @@ class WhatsAppService extends BaseMessagingService {
     logger.info("WhatsApp", "muteChat() called", { chatId, mute })
     if (!this.ready) return false
     try {
-      const chat = await this.client.getChatById(chatId)
       if (mute) {
-        await chat.mute()
+        await this.client.muteChat(chatId)
       } else {
-        await chat.unmute()
+        await this.client.unmuteChat(chatId)
       }
       logger.info("WhatsApp", "Chat mute toggled", { chatId, mute })
       return true
@@ -892,11 +919,10 @@ class WhatsAppService extends BaseMessagingService {
     logger.info("WhatsApp", "archiveChat() called", { chatId, archive })
     if (!this.ready) return false
     try {
-      const chat = await this.client.getChatById(chatId)
       if (archive) {
-        await chat.archive()
+        await this.client.archiveChat(chatId)
       } else {
-        await chat.unarchive()
+        await this.client.unarchiveChat(chatId)
       }
       logger.info("WhatsApp", "Chat archive toggled", { chatId, archive })
       return true
@@ -924,7 +950,8 @@ class WhatsAppService extends BaseMessagingService {
   }
 
   private formatChat(chat: ChatLike): ChatData {
-    const chatId = typeof chat.id === "string" ? chat.id : chat.id?._serialized || ""
+    const chatId =
+      typeof chat.id === "string" ? chat.id : chat.id?._serialized || chat.id?.$1 || ""
     const lastBody = chat.lastMessage?.body || ""
     const lastTimestamp =
       chat.timestamp || chat.lastMessage?.timestamp || chat.lastMessage?.t || chat.t || 0
@@ -949,12 +976,35 @@ class WhatsAppService extends BaseMessagingService {
     }
   }
 
+  /**
+   * Serialized id of a message.
+   *
+   * WhatsApp Web 2.3000.x renamed this field on message keys (`_serialized` →
+   * `$1`). {@link installWhatsAppCompat} restores the old name, and this reads
+   * either, so ids stay usable for replies, deletes, edits and media even if the
+   * compatibility layer could not run.
+   */
+  private messageIdOf(message: pkg.Message): string {
+    const id = message.id as unknown as { _serialized?: string; $1?: string } | undefined
+    return id?._serialized ?? id?.$1 ?? ""
+  }
+
+  /** Display name of a chat, falling back to its id. */
+  private async chatNameFor(chatId: string): Promise<string> {
+    try {
+      const chat = await this.client.getChatById(chatId)
+      return chat.name || chatId
+    } catch {
+      return chatId
+    }
+  }
+
   private formatMessage(message: pkg.Message): MessageData {
     const msgAny = message as unknown as {
       _data?: {
         filename?: string
         size?: number
-        quotedMsg?: { id?: { _serialized?: string }; body?: string }
+        quotedMsg?: { id?: { _serialized?: string; $1?: string }; body?: string }
         quotedStanzaID?: string
       }
       filename?: string
@@ -967,8 +1017,10 @@ class WhatsAppService extends BaseMessagingService {
       quotedMsgId?: string
     }
 
+    const messageId = this.messageIdOf(message)
+
     logger.debug("WhatsApp", "formatMessage() called", {
-      id: message.id._serialized,
+      id: messageId,
       fromMe: message.fromMe,
       type: message.type,
       hasMedia: message.hasMedia,
@@ -986,18 +1038,19 @@ class WhatsAppService extends BaseMessagingService {
         filename,
         filesize: msgAny.filesize || msgAny._data?.size,
         // Media bytes are fetched lazily from this message id.
-        messageId: message.id._serialized,
+        messageId,
       }
     }
 
     // Try multiple paths for quotedMsgId since WhatsApp structure varies
     const quotedMsgId =
       msgAny._data?.quotedMsg?.id?._serialized ||
+      msgAny._data?.quotedMsg?.id?.$1 ||
       msgAny._data?.quotedStanzaID ||
       msgAny.quotedMsgId
 
     return {
-      id: message.id._serialized,
+      id: messageId,
       body: message.body || "",
       timestamp: message.timestamp,
       fromMe: message.fromMe,
@@ -1031,16 +1084,13 @@ class WhatsAppService extends BaseMessagingService {
     }
 
     try {
-      // Get the chat and fetch the specific message
-      const chat = await this.client.getChatById(chatId)
-      const chatName = chat.name || chatId
-      const messages = await chat.fetchMessages({ limit: 100 })
-      const waMessage = messages.find((m) => m.id._serialized === messageId)
-
+      const waMessage = await this.client.getMessageById(messageId)
       if (!waMessage || !waMessage.hasMedia) {
         logger.warn("WhatsApp", "Message not found or has no media", { messageId })
         return null
       }
+
+      const chatName = await this.chatNameFor(chatId)
 
       const msgAny = waMessage as unknown as { _data?: { filename?: string }; filename?: string; mimetype?: string }
       const filename = msgAny._data?.filename || msgAny.filename || "media"

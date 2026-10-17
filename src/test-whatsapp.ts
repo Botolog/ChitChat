@@ -7,6 +7,7 @@ import pkg from "whatsapp-web.js"
 const { Client, LocalAuth } = pkg
 import { renderQrBlocks } from "./utils/qr"
 import { collectWhatsAppChats } from "./utils/whatsappChats"
+import { installWhatsAppCompat } from "./utils/whatsappCompat"
 import { appendFileSync, writeFileSync } from "fs"
 
 const LOG_FILE = "whatsapp-test.log"
@@ -135,9 +136,18 @@ async function main() {
     // TEST: Load chats using the exact same method as the GUI
     log("INFO", "=== TESTING CHAT LOADING ===")
     try {
+      const pupPage = (client as any).pupPage
+
+      // Install the same compatibility layer the app installs, so this probe
+      // reproduces the app's behaviour (see utils/whatsappCompat).
+      if (pupPage) {
+        const compat = await pupPage.evaluate(installWhatsAppCompat)
+        log("INFO", "Compatibility layer:", compat)
+      }
+
       // Read WhatsApp's collection directly, the way the app does.
       log("INFO", "Reading WhatsApp's chat collection via collectWhatsAppChats()...")
-      const pupPage = (client as any).pupPage
+      const chatIds: string[] = []
       if (pupPage) {
         const collected = await pupPage.evaluate(collectWhatsAppChats)
         log("INFO", "Chat collection read result:", {
@@ -157,6 +167,7 @@ async function main() {
             unreadCount: chat.unreadCount,
             lastMsgBody: chat.lastMessage?.body?.slice(0, 30) || "[none]",
           })
+          if (typeof chat.id === "string" && chatIds.length < 3) chatIds.push(chat.id)
         }
       } else {
         log("WARN", "pupPage not available")
@@ -209,7 +220,39 @@ async function main() {
           log("INFO", `  ${i + 1}. ${chat.name} (${time})`)
         }
       }
-      
+
+      // TEST: read messages and look a message up by id — the paths the UI uses
+      // when a chat is opened, replied to, edited, deleted or has media opened.
+      log("INFO", "=== TESTING MESSAGE READ ===")
+      for (const chatId of chatIds) {
+        try {
+          const chat = await client.getChatById(chatId)
+          const messages = await chat.fetchMessages({ limit: 5 })
+          const firstId =
+            messages[0]?.id?._serialized ?? (messages[0]?.id as any)?.$1 ?? null
+          log("INFO", "getChatById + fetchMessages OK", {
+            chatId,
+            name: chat.name,
+            messages: messages.length,
+            firstMessageId: firstId,
+            firstBody: messages[0]?.body?.slice(0, 30) ?? "",
+          })
+
+          if (firstId) {
+            const found = await client.getMessageById(firstId)
+            log("INFO", "getMessageById OK", { messageId: firstId, found: !!found })
+          }
+        } catch (err: any) {
+          log("ERROR", "message read failed", {
+            chatId,
+            message: err.message,
+            stack: err.stack,
+          })
+        }
+      }
+
+      const finalCompat = pupPage ? await pupPage.evaluate(() => (globalThis as any).__chitchatCompat ?? null) : null
+      log("INFO", "Compatibility layer after tests:", finalCompat)
       log("INFO", "=== CHAT LOADING TEST COMPLETE ===")
     } catch (err: any) {
       log("ERROR", "Failed to load chats!", {

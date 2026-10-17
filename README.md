@@ -187,6 +187,32 @@ Architecture and conventions are documented in
   and `whatsapp.log` shows a `collectionError`, WhatsApp Web's internals have
   moved again; `chitchat --reset-whatsapp` and re-linking is the first thing to
   try.
+- **Chats listed, but opening one shows no messages (and sending does nothing).**
+  On WhatsApp Web 2.3000.x, a *message key*'s serialized id moved from
+  `_serialized` to `$1`. `whatsapp-web.js` reads `_serialized` everywhere, so on
+  that build every call that resolves a chat fails with an opaque `r: r` — reading
+  messages, sending, marking read, pinning, deleting, downloading media. The
+  newest library release (1.34.7) predates the rename and the upstream fixes are
+  still in review
+  ([`#201845`](https://github.com/wwebjs/whatsapp-web.js/issues/201845),
+  [PR #201850](https://github.com/wwebjs/whatsapp-web.js/pull/201850)), so ChitChat
+  applies them itself, at runtime, right after the library injects itself into the
+  page (`src/utils/whatsappCompat.ts`): message keys get their `_serialized` back
+  and the chat/message mappers fall back to a minimal model instead of throwing.
+
+  The log confirms it once per connection:
+
+  ```
+  [INFO] [WhatsApp] Installed WhatsApp Web compatibility layer |
+         {"patches":["messageKey._serialized","getMessageModel",…],"wwebVersion":"2.3000.…"}
+  ```
+
+  If an operation still fails, look at the `compat` object in the **page state
+  dump**: a rising `chatModelFallbacks` / `messageModelFallbacks` means WhatsApp
+  changed its models again and ChitChat is running on its own minimal mapping
+  (names and previews may be plain ids, quotes may not render). `"patches":[]`
+  means the build needed nothing. `bun run test:whatsapp` reproduces this whole
+  path headlessly and writes `whatsapp-test.log`.
 - **"Could not find Chrome".** Puppeteer could not locate the exact browser
   revision it expects. Install a matching browser, let Puppeteer download one, or
   set `PUPPETEER_EXECUTABLE_PATH` to an existing Chromium/Chrome binary. For the
