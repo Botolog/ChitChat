@@ -1,9 +1,12 @@
 import pkg from "whatsapp-web.js"
 const { Client, LocalAuth, WAState } = pkg
 import { existsSync } from "fs"
+import { join } from "path"
 import { Logger } from "../utils/logger"
 import { mediaCache } from "../utils/mediaCache"
 import { renderQrBlocks } from "../utils/qr"
+import { resolveDataPath } from "../utils/paths"
+import { recoverProfileLock, ProfileLockedError } from "../utils/profileLock"
 import { BaseMessagingService } from "./base"
 import type { ServiceCapabilities } from "./capabilities"
 import type {
@@ -17,6 +20,16 @@ import type {
 export type { ChatData, ContactData, MediaAttachment, MessageData }
 
 const logger = new Logger("whatsapp.log", "WhatsApp")
+
+/** Directory holding whatsapp-web.js' `LocalAuth` session (the Chromium profile). */
+function whatsappAuthDataPath(): string {
+  return resolveDataPath(".wwebjs_auth")
+}
+
+/** Chromium profile directory for the default (clientId-less) LocalAuth session. */
+function whatsappSessionDir(): string {
+  return join(whatsappAuthDataPath(), "session")
+}
 
 /** Capabilities advertised to the UI. */
 const WHATSAPP_CAPABILITIES: ServiceCapabilities = {
@@ -138,7 +151,7 @@ class WhatsAppService extends BaseMessagingService {
       cacheDir: process.env.PUPPETEER_CACHE_DIR,
     })
     this.client = new Client({
-      authStrategy: new LocalAuth(),
+      authStrategy: new LocalAuth({ dataPath: whatsappAuthDataPath() }),
       puppeteer: buildPuppeteerOptions(),
     })
     this.setupEventHandlers()
@@ -337,10 +350,23 @@ class WhatsAppService extends BaseMessagingService {
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err)
         logger.error("WhatsApp", `Attempt ${attempt} failed`, { error: message })
+        // A live lock owner will not go away by retrying: fail fast with the
+        // actionable message instead of burning the backoff window.
+        if (err instanceof ProfileLockedError) {
+          logger.error(
+            "WhatsApp",
+            "Aborting retries: WhatsApp session is locked by another process",
+            { ownerPid: err.ownerPid, dir: whatsappSessionDir() },
+          )
+          throw err
+        }
         if (attempt >= maxRetries) {
           logger.error("WhatsApp", "All initialization attempts failed")
           throw err
         }
+        // Best effort: make sure a half-started browser from this attempt is
+        // gone so it cannot hold the profile lock for the next one.
+        await this.closeBrowserBestEffort()
         const backoffMs = Math.min(1000 * Math.pow(2, attempt - 1), 30000)
         logger.info("WhatsApp", `Retrying in ${backoffMs}ms...`)
         await new Promise((resolve) => setTimeout(resolve, backoffMs))
@@ -354,6 +380,16 @@ class WhatsAppService extends BaseMessagingService {
    * so a failed/timed-out attempt leaves nothing behind and can be retried.
    */
   private initializeOnce(): Promise<void> {
+    // Recover a leftover Chromium profile lock before launching. Throws a
+    // `ProfileLockedError` (with the owner PID) when another live process still
+    // owns the profile.
+    const lock = recoverProfileLock(whatsappSessionDir())
+    if (lock.recovered) {
+      logger.warn("WhatsApp", "Removed stale Chromium profile lock", {
+        dir: whatsappSessionDir(),
+        ownerPid: lock.ownerPid,
+      })
+    }
     return new Promise<void>((resolve, reject) => {
       const cleanup = () => {
         this.removeListener("ready", readyHandler)
@@ -914,7 +950,7 @@ class WhatsAppService extends BaseMessagingService {
 
       // Recreate client and re-register handlers for the new instance
       this.client = new Client({
-        authStrategy: new LocalAuth(),
+        authStrategy: new LocalAuth({ dataPath: whatsappAuthDataPath() }),
         puppeteer: buildPuppeteerOptions(),
       })
       this.handlersRegistered = false
@@ -924,6 +960,27 @@ class WhatsAppService extends BaseMessagingService {
     } catch (err) {
       logger.error("WhatsApp", "Reconnection failed", err)
       throw err
+    }
+  }
+
+  /**
+   * Best-effort close of the underlying browser process.
+   *
+   * `client.destroy()` only calls `browser.close()` when the browser still
+   * reports itself as connected; if the connection dropped first it silently
+   * leaks a Chromium holding the profile lock, which breaks the *next* launch
+   * with a confusing "browser is already running" error. Closing the handle
+   * explicitly (and on a timeout, so shutdown can never hang) avoids that.
+   */
+  private async closeBrowserBestEffort(): Promise<void> {
+    const browser = (this.client as unknown as { pupBrowser?: { close?: () => Promise<void> } })
+      .pupBrowser
+    if (!browser?.close) return
+    try {
+      await this.withTimeout(browser.close(), 10000, "browser.close()")
+      logger.info("WhatsApp", "Browser closed")
+    } catch (err) {
+      logger.warn("WhatsApp", "Best-effort browser close failed", err)
     }
   }
 
@@ -942,6 +999,7 @@ class WhatsAppService extends BaseMessagingService {
     } catch (err) {
       logger.error("WhatsApp", "Error destroying client", err)
     }
+    await this.closeBrowserBestEffort()
   }
 }
 

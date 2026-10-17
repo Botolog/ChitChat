@@ -139,6 +139,22 @@ Architecture and conventions are documented in
   revision it expects. Install a matching browser, let Puppeteer download one, or
   set `PUPPETEER_EXECUTABLE_PATH` to an existing Chromium/Chrome binary. For the
   snap, see [`docs/PACKAGING.md`](docs/PACKAGING.md).
+- **"Session locked by other app" / "browser is already running".** Chromium
+  keeps the WhatsApp profile (`<data dir>/.wwebjs_auth/session`) locked while it
+  runs. This appears when a *previous* ChitChat was killed before it could close
+  its browser, or when a second instance is already using the same profile.
+  ChitChat clears a stale lock automatically when the owning process is gone; if
+  it is still alive, close the other ChitChat/Chromium and retry. To clean up
+  manually (Linux):
+
+  ```sh
+  pkill -f 'user-data-dir=.*\.wwebjs_auth'          # stop orphaned Chromium
+  rm -f "$DATA_DIR/.wwebjs_auth/session"/Singleton* # drop a stale lock
+  ```
+
+  where `$DATA_DIR` is `CHITCHAT_DATA_DIR` (in the snap:
+  `~/snap/chitchat/common`). Deleting the whole `session` directory instead
+  forces a fresh QR scan.
 - **Logs.** Find startup/connection details in `chitchat.log`, `whatsapp.log`
   and `slack.log` (in `CHITCHAT_LOG_DIR`, or `$SNAP_USER_COMMON` in the snap).
   Increase verbosity via Settings → Advanced → Log Level.
