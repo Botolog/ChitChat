@@ -7,6 +7,7 @@ import { mediaCache } from "../utils/mediaCache"
 import { renderQrBlocks } from "../utils/qr"
 import { resolveDataPath } from "../utils/paths"
 import { recoverProfileLock, ProfileLockedError } from "../utils/profileLock"
+import { clearWhatsAppTabState } from "../utils/whatsappTabState"
 import { BaseMessagingService } from "./base"
 import type { ServiceCapabilities } from "./capabilities"
 import type {
@@ -148,6 +149,29 @@ function buildPuppeteerOptions() {
   }
 }
 
+/**
+ * Shared `whatsapp-web.js` client options. Kept in one place so the initial
+ * client and the reconnect client can never drift apart.
+ *
+ * Two WhatsApp Web behaviours make this client unusable in the field, so both
+ * are neutralised here (see {@link clearWhatsAppTabState}):
+ *
+ * - `evalOnNewDoc` drops stale tab-coordination state, without which a launch
+ *   can hang forever on "WhatsApp is open in another window".
+ * - `takeoverOnConflict` makes this client reclaim the session when WhatsApp's
+ *   server reports that another browser is using it, instead of disconnecting
+ *   and requiring a restart.
+ */
+function buildClientOptions(): pkg.ClientOptions {
+  return {
+    authStrategy: new LocalAuth({ dataPath: whatsappAuthDataPath() }),
+    puppeteer: buildPuppeteerOptions(),
+    evalOnNewDoc: clearWhatsAppTabState,
+    takeoverOnConflict: true,
+    takeoverTimeoutMs: 0,
+  }
+}
+
 class WhatsAppService extends BaseMessagingService {
   readonly id = "whatsapp"
   readonly displayName = "WhatsApp"
@@ -172,10 +196,7 @@ class WhatsAppService extends BaseMessagingService {
       hasEnvVar: !!process.env.PUPPETEER_EXECUTABLE_PATH,
       cacheDir: process.env.PUPPETEER_CACHE_DIR,
     })
-    this.client = new Client({
-      authStrategy: new LocalAuth({ dataPath: whatsappAuthDataPath() }),
-      puppeteer: buildPuppeteerOptions(),
-    })
+    this.client = new Client(buildClientOptions())
     this.setupEventHandlers()
   }
 
@@ -538,6 +559,18 @@ class WhatsAppService extends BaseMessagingService {
           } catch {
             socket = null
           }
+          // WhatsApp's own tab mutex: when it is owned by another window the
+          // socket never launches and the page shows "WhatsApp is open in
+          // another window" instead of a QR code.
+          let tabMutex: string | null = null
+          let noTakeover: boolean | null = null
+          try {
+            const mutex = g.require("WAWebUserPrefsTabMutex")
+            tabMutex = mutex.getMutex?.() ?? null
+            noTakeover = mutex.getNoTakeover?.() ?? null
+          } catch {
+            // Module not loaded yet — the rest of the dump is still useful.
+          }
           return {
             href: g.location?.href ?? null,
             title: g.document?.title ?? null,
@@ -550,6 +583,8 @@ class WhatsAppService extends BaseMessagingService {
             socketStream: socket?.stream ?? null,
             wsReadyState: socket?.socket?.readyState ?? null,
             hasSynced: socket?.hasSynced ?? null,
+            tabMutex,
+            noTakeover,
             bodyText: String(g.document?.body?.innerText ?? "")
               .replace(/\s+/g, " ")
               .slice(0, 400),
@@ -1111,10 +1146,7 @@ class WhatsAppService extends BaseMessagingService {
       await new Promise((resolve) => setTimeout(resolve, 2000))
 
       // Recreate client and re-register handlers for the new instance
-      this.client = new Client({
-        authStrategy: new LocalAuth({ dataPath: whatsappAuthDataPath() }),
-        puppeteer: buildPuppeteerOptions(),
-      })
+      this.client = new Client(buildClientOptions())
       this.handlersRegistered = false
       this.setupEventHandlers()
       await this.initialize()

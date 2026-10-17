@@ -229,6 +229,18 @@ Services:
 - S3 Slack refresh-token loss; atomic 0600 token writes; clear refresh timer on destroy.
 - S4 Slack bounded init recursion; wrap socket handlers.
 
+WhatsApp field hardening (reported from a real install):
+- W5 "connecting…" forever, socket stuck at `UNLAUNCHED`: WhatsApp Web's
+  cross-window tab mutex (`whatsapp-mutex`/`no-takeover`/`local-takeover-ok`) was
+  left behind in the profile, so the page showed "WhatsApp is open in another
+  window" and never launched its socket. Clear that state in-page before WhatsApp
+  boots (`evalOnNewDoc`) and reclaim server-side session conflicts
+  (`takeoverOnConflict`). See `src/utils/whatsappTabState.ts`.
+- W6 stale Chromium `SingletonLock` after a killed run → "browser is already
+  running" (fixed in `src/utils/profileLock.ts`).
+- W7 page-state diagnostics (socket state, WhatsApp Web build, tab mutex) on
+  every failed attempt, plus `--reset-whatsapp`.
+
 Media:
 - M1 path traversal in `MediaServer`; bind `127.0.0.1`.
 - M2 image display modes never render (use `messageId`).

@@ -138,7 +138,7 @@ Architecture and conventions are documented in
   [ERROR] [WhatsApp] Page state dump (attempt 1 failed: ...) | {
     "href":"https://web.whatsapp.com/", "wwebVersion":"2.3000.…",
     "socketState":"UNLAUNCHED", "wsReadyState":null,
-    "bodyText":"…" }
+    "bodyText":"…", "tabMutex":"…", "noTakeover":false }
   ```
 
   Read it like this:
@@ -146,17 +146,29 @@ Architecture and conventions are documented in
     browser, an error, or a "scan the QR" prompt, that names the problem.
   - `wwebVersion` is the live WhatsApp Web build. A stale build usually means a
     cached app in the profile — run `chitchat --reset-whatsapp` and re-link.
+  - `bodyText` saying **"WhatsApp is open in another window"** means WhatsApp Web
+    gave up on its cross-window lock instead of starting its socket. ChitChat
+    clears that lock state before WhatsApp boots, so this should not happen any
+    more; if it does, a leftover Chromium from an earlier run is likely sharing
+    the profile (see the "browser is already running" entry below).
   - `socketState` stuck at `UNLAUNCHED`/`OPENING` with `wsReadyState` `null`
-    means WhatsApp's WebSocket never connected. This is usually **network-level**
-    (a blocked/NAT'd connection) or a **WhatsApp outage** — check that
-    `https://web.whatsapp.com` works in a normal browser on that machine, and
-    retry later.
+    (and no "another window" text) means WhatsApp's WebSocket never connected.
+    This is usually **network-level** (a blocked/NAT'd connection) or a
+    **WhatsApp outage** — check that `https://web.whatsapp.com` works in a normal
+    browser on that machine, and retry later.
   - `page request failed` / `page http error` lines just above the dump show
     exactly which resources failed, if any.
 
   Reaching WhatsApp's WebSocket is a hard requirement; no client-side setting
   can work around a blocked connection. To fail fast while debugging, set
   `CHITCHAT_WHATSAPP_INIT_TIMEOUT_MS=45000` (default `180000`).
+- **Stuck on "○ Connecting…" with no QR.** WhatsApp Web booted but never started
+  its socket. ChitChat handles the two known causes automatically: WhatsApp Web
+  believing another window owns the session (its cross-window flag is cleared
+  before WhatsApp boots), and a stale Chromium profile lock (cleared when its
+  owner is gone). If it still happens, a leftover Chromium is probably sharing
+  the profile — see the "browser is already running" entry below, and read the
+  page state dump described next.
 - **Reset the WhatsApp session.** `chitchat --reset-whatsapp` deletes the saved
   profile (`<data dir>/.wwebjs_auth`, which is a real Chromium user-data dir plus
   any cached WhatsApp Web build) and exits; start again and scan the QR. Use it
@@ -174,10 +186,13 @@ Architecture and conventions are documented in
   runs. This appears when a *previous* ChitChat was killed before it could close
   its browser, or when a second instance is already using the same profile.
   ChitChat clears a stale lock automatically when the owning process is gone; if
-  it is still alive, close the other ChitChat/Chromium and retry. To clean up
-  manually (Linux):
+  it is still alive, close the other ChitChat/Chromium and retry. Even without
+  the lock, a leftover Chromium keeps WhatsApp's own "active window" flag and can
+  stall a new launch, so it is worth checking for one:
 
   ```sh
+  pgrep -af 'user-data-dir=.*\.wwebjs_auth'   # list leftovers
+  # then clean up manually:
   pkill -f 'user-data-dir=.*\.wwebjs_auth'          # stop orphaned Chromium
   rm -f "$DATA_DIR/.wwebjs_auth/session"/Singleton* # drop a stale lock
   ```
