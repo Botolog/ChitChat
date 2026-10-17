@@ -120,6 +120,7 @@ class WhatsAppService extends EventEmitter {
   private client: pkg.Client
   private ready = false
   private qrCode: string | null = null
+  private readyFallback: NodeJS.Timeout | null = null
 
   constructor() {
     super()
@@ -151,16 +152,16 @@ class WhatsAppService extends EventEmitter {
 
     this.client.on("ready", () => {
       logger.event("WhatsApp", "EVENT: ready - WhatsApp client is fully ready!")
-      logger.info("WhatsApp", "Setting this.ready = true")
-      this.ready = true
-      this.qrCode = null
-      this.emit("ready")
-      logger.info("WhatsApp", "Emitted ready event to listeners")
+      this.markReady("client ready event")
     })
 
     this.client.on("authenticated", () => {
       logger.event("WhatsApp", "EVENT: authenticated - session validated")
       this.emit("authenticated")
+      // whatsapp-web.js sometimes never emits "ready" after "authenticated"
+      // (the store sync stalls even though the connection is fine). Without a
+      // fallback the app stays stuck on "Authenticated..." forever.
+      this.startReadyFallback()
       logger.debug("WhatsApp", "Emitted authenticated event")
     })
 
@@ -225,6 +226,63 @@ class WhatsAppService extends EventEmitter {
     })
 
     logger.info("WhatsApp", "=== All event handlers registered ===")
+  }
+
+  private clearReadyFallback() {
+    if (this.readyFallback) {
+      clearInterval(this.readyFallback)
+      this.readyFallback = null
+    }
+  }
+
+  /** Mark the client ready exactly once and notify listeners. */
+  private markReady(source: string) {
+    if (this.ready) return
+    this.clearReadyFallback()
+    logger.info("WhatsApp", "Setting this.ready = true", { source })
+    this.ready = true
+    this.qrCode = null
+    this.emit("ready")
+    logger.info("WhatsApp", "Emitted ready event to listeners")
+  }
+
+  /**
+   * Safety net for whatsapp-web.js not emitting "ready" after "authenticated".
+   *
+   * The connection can be fully established (state CONNECTED, chats available)
+   * while the "ready" event never arrives, which left the app stuck on
+   * "Authenticated..." forever. Poll the connection state and, once it is
+   * CONNECTED (or after a bounded ~30s wait), declare the client ready so the
+   * UI can proceed to load chats.
+   */
+  private startReadyFallback() {
+    if (this.ready || this.readyFallback) return
+    const intervalMs = 2000
+    const maxAttempts = 15 // ~30s
+    let attempts = 0
+    logger.info("WhatsApp", "Starting ready fallback in case the \"ready\" event never fires")
+    this.readyFallback = setInterval(async () => {
+      attempts++
+      if (this.ready) {
+        this.clearReadyFallback()
+        return
+      }
+      try {
+        const state = await this.client.getState()
+        logger.debug("WhatsApp", "Ready fallback: client state", { state, attempts })
+        if (state === "CONNECTED") {
+          logger.warn("WhatsApp", "\"ready\" never fired but state is CONNECTED - continuing anyway")
+          this.markReady("ready fallback: state CONNECTED")
+          return
+        }
+      } catch (err: any) {
+        logger.debug("WhatsApp", "Ready fallback: getState() failed", { error: err?.message })
+      }
+      if (attempts >= maxAttempts) {
+        logger.warn("WhatsApp", "Ready fallback timed out - continuing anyway")
+        this.markReady("ready fallback: timed out")
+      }
+    }, intervalMs)
   }
 
   async initialize(maxRetries: number = 3): Promise<void> {
@@ -339,8 +397,8 @@ class WhatsAppService extends EventEmitter {
       })
       
       if (rawChats.error) {
-        logger.error("WhatsApp", "Store access failed", { error: rawChats.error })
-        return []
+        logger.warn("WhatsApp", "Direct Store access failed - falling back to client.getChats()", { error: rawChats.error })
+        return await this.getChatsViaClient()
       }
       
       logger.info("WhatsApp", "Raw chats from Store", { 
@@ -375,6 +433,46 @@ class WhatsAppService extends EventEmitter {
       return sorted
     } catch (err) {
       logger.error("WhatsApp", "getChats() EXCEPTION", err)
+      return []
+    }
+  }
+
+  /**
+   * Fallback used when WhatsApp Web's internal Store is unreachable: use the
+   * public whatsapp-web.js API, bounded by a timeout so a stall cannot hang the
+   * UI indefinitely.
+   */
+  private async getChatsViaClient(): Promise<ChatData[]> {
+    try {
+      const timeout = new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error("client.getChats() timed out after 30s")), 30000)
+      )
+      const raw = (await Promise.race([this.client.getChats(), timeout])) as any[]
+      logger.info("WhatsApp", "client.getChats() returned chats", { count: raw.length })
+
+      const normalized = raw.map((c: any) => ({
+        id: c.id?._serialized || String(c.id),
+        name: c.name || c.lastMessage?.body || "Unknown",
+        isGroup: !!c.isGroup,
+        unreadCount: c.unreadCount || 0,
+        archived: !!c.archived,
+        pinned: !!c.pinned,
+        muted: !!c.isMuted,
+        timestamp: c.timestamp || c.lastMessage?.timestamp || 0,
+        lastMessageBody: c.lastMessage?.body || "",
+        participantCount: c.isGroup ? (c.groupMetadata?.participants?.length || 0) : 0,
+      }))
+
+      return normalized
+        .filter((chat) => !chat.archived)
+        .map((chat) => this.formatChat(chat))
+        .sort((a, b) => {
+          if (a.pinned && !b.pinned) return -1
+          if (!a.pinned && b.pinned) return 1
+          return (b.lastMessage?.timestamp ?? 0) - (a.lastMessage?.timestamp ?? 0)
+        })
+    } catch (err) {
+      logger.error("WhatsApp", "getChatsViaClient() failed", err)
       return []
     }
   }
