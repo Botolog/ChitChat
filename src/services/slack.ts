@@ -792,7 +792,6 @@ class SlackService extends EventEmitter {
       body: msg.text || "",
       timestamp,
       fromMe: isFromMe,
-      author: userId,
       authorName,
       hasMedia,
       type,

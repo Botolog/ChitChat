@@ -65,6 +65,7 @@ bun build src/index.ts \
   --minify \
   --sourcemap \
   --target=bun \
+  --external @aws-sdk/client-s3 \
   --outfile build/chitchat
 
 chmod +x build/chitchat

@@ -1,7 +1,7 @@
 import { readFileSync, existsSync } from "fs"
 import { exec } from "child_process"
 import { promisify } from "util"
-import type { MediaAttachment } from "../services/whatsapp"
+import type { MediaAttachment } from "../services/types"
 import type { MediaDisplayMode } from "./terminalCapabilities"
 import { mediaCache } from "./mediaCache"
 import { mediaServer } from "./mediaServer"
@@ -13,13 +13,8 @@ export class MediaRenderer {
   
   // Get cached media file path or null if not cached
   private getCachedMediaPath(media: MediaAttachment): string | null {
-    // If data is already a file path, use it
-    if (media.data && typeof media.data === 'string' && media.data.startsWith('/')) {
-      return existsSync(media.data) ? media.data : null
-    }
-    
-    // For now, we can't get from cache here without chat context
-    // Media should already have the file path in the data field after download
+    // Media bytes are downloaded lazily; without a cached path we cannot render
+    // here. Callers resolve the path via the media cache after downloading.
     return null
   }
 

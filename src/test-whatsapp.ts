@@ -5,7 +5,7 @@
 
 import pkg from "whatsapp-web.js"
 const { Client, LocalAuth } = pkg
-import qrcode from "qrcode-terminal"
+import { renderQrBlocks } from "./utils/qr"
 import { appendFileSync, writeFileSync } from "fs"
 
 const LOG_FILE = "whatsapp-test.log"
@@ -61,7 +61,7 @@ async function main() {
   client.on("qr", (qr) => {
     log("EVENT", "QR code received", { length: qr.length })
     console.log("\n=== SCAN THIS QR CODE ===")
-    qrcode.generate(qr, { small: true })
+    console.log(renderQrBlocks(qr))
     console.log("=========================\n")
   })
 

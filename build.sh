@@ -12,6 +12,7 @@ bun build src/index.ts \
   --minify \
   --sourcemap \
   --target=bun \
+  --external @aws-sdk/client-s3 \
   --outfile build/chitchat
 
 echo "Build complete! Executable: build/chitchat"

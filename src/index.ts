@@ -15,10 +15,23 @@ import { SERVICES, getServiceTheme, getEnabledServices, type ServiceConfig, type
 import { createMainMenuState, renderMainMenu, navigateMenu, getSelectedService, renderGlobalSettings, type MainMenuState } from "./ui/mainMenu"
 import { detectTerminalCapabilities, getOptimalDisplayMode, type MediaDisplayMode } from "./utils/terminalCapabilities"
 import { MediaRenderer } from "./utils/mediaRenderer"
-import type { MessageData, MediaAttachment, ChatData } from "./services/whatsapp"
+import type { MessageData, MediaAttachment, ChatData } from "./services/types"
 import { mediaCache } from "./utils/mediaCache"
 
 const DEMO_MODE = process.argv.includes("--demo")
+
+/**
+ * OpenTUI 0.6 removed `Renderable.remove(id: string)` in favour of
+ * `remove(child: BaseRenderable)`. This resolves a child by id first and
+ * removes it when present, keeping the call sites readable.
+ */
+function removeChildById(
+  parent: { getRenderable(id: string): unknown; remove(child: any): void },
+  id: string,
+): void {
+  const child = parent.getRenderable(id)
+  if (child) parent.remove(child)
+}
 
 if (process.argv.includes("--help") || process.argv.includes("-h")) {
   console.log(`
@@ -113,15 +126,15 @@ const DEMO_MESSAGES: Record<string, MessageData[]> = {
     { id: "m4", body: "See you tomorrow!", timestamp: Date.now() / 1000 - 3600, fromMe: true, hasMedia: false, type: "chat", ack: 3 },
   ],
   "3": [
-    { id: "m1", body: "Team, don't forget the meeting", timestamp: Date.now() / 1000 - 10000, fromMe: false, author: "Boss", hasMedia: false, type: "chat", ack: 3, isForwarded: true },
+    { id: "m1", body: "Team, don't forget the meeting", timestamp: Date.now() / 1000 - 10000, fromMe: false, authorName: "Boss", hasMedia: false, type: "chat", ack: 3, isForwarded: true },
     { id: "m2", body: "I'll be there", timestamp: Date.now() / 1000 - 9000, fromMe: true, hasMedia: false, type: "chat", ack: 3 },
-    { id: "m3", body: "Same here 👍", timestamp: Date.now() / 1000 - 8500, fromMe: false, author: "Alice", hasMedia: false, type: "chat", ack: 3, hasQuotedMsg: true, quotedMsgBody: "Team, don't forget the meeting", quotedMsgId: "m1" },
-    { id: "m4", body: "Meeting at 3pm", timestamp: Date.now() / 1000 - 7200, fromMe: false, author: "Boss", hasMedia: false, type: "chat", ack: 3, isStarred: true },
+    { id: "m3", body: "Same here 👍", timestamp: Date.now() / 1000 - 8500, fromMe: false, authorName: "Alice", hasMedia: false, type: "chat", ack: 3, hasQuotedMsg: true, quotedMsgBody: "Team, don't forget the meeting", quotedMsgId: "m1" },
+    { id: "m4", body: "Meeting at 3pm", timestamp: Date.now() / 1000 - 7200, fromMe: false, authorName: "Boss", hasMedia: false, type: "chat", ack: 3, isStarred: true },
   ],
   "4": [
-    { id: "m1", body: "Happy birthday! 🎂🎉", timestamp: Date.now() / 1000 - 90000, fromMe: false, author: "Mom", hasMedia: false, type: "chat", ack: 3, isForwarded: true, forwardingScore: 5 },
+    { id: "m1", body: "Happy birthday! 🎂🎉", timestamp: Date.now() / 1000 - 90000, fromMe: false, authorName: "Mom", hasMedia: false, type: "chat", ack: 3, isForwarded: true, forwardingScore: 5 },
     { id: "m2", body: "Thanks everyone!", timestamp: Date.now() / 1000 - 89000, fromMe: true, hasMedia: false, type: "chat", ack: 3 },
-    { id: "m3", body: "🎈🎁", timestamp: Date.now() / 1000 - 88000, fromMe: false, author: "Dad", hasMedia: false, type: "chat", ack: 3 },
+    { id: "m3", body: "🎈🎁", timestamp: Date.now() / 1000 - 88000, fromMe: false, authorName: "Dad", hasMedia: false, type: "chat", ack: 3 },
   ],
   "5": [
     { id: "m1", body: "Can you help me with the code?", timestamp: Date.now() / 1000 - 200000, fromMe: false, hasMedia: false, type: "chat", ack: 3 },
@@ -207,7 +220,7 @@ async function main() {
     // Update left border 'l' characters for new height
     // Remove old border characters and recreate
     for (let i = 0; i < 100; i++) { // Remove up to 100 old characters
-      chatListLeftBorder.remove(`chat-border-l-${i}`)
+      removeChildById(chatListLeftBorder, `chat-border-l-${i}`)
     }
     for (let i = 0; i < height - 2; i++) {
       const borderChar = new TextRenderable(renderer, {
@@ -220,7 +233,7 @@ async function main() {
     
     // Update right border 'l' characters for new height
     for (let i = 0; i < 100; i++) { // Remove up to 100 old characters
-      messagesRightBorder.remove(`messages-border-l-${i}`)
+      removeChildById(messagesRightBorder, `messages-border-l-${i}`)
     }
     for (let i = 0; i < height - 2; i++) {
       const borderChar = new TextRenderable(renderer, {
@@ -677,7 +690,7 @@ async function main() {
   function buildSettingsItems() {
     // Remove all previously added dynamic items by ID
     for (const id of settingsItemIds) {
-      settingsBox.remove(id)
+      removeChildById(settingsBox, id)
     }
     settingsItemIds = []
     
@@ -1167,12 +1180,12 @@ async function main() {
       DEMO_MODE 
     })
     
-    chatListBox.remove("loading-text")
+    removeChildById(chatListBox, "loading-text")
     logger.debug("RenderChats", "Removed loading text")
     
     // Remove all previously rendered chat items by their actual IDs
     for (const id of chatItemIds) {
-      chatListBox.remove(id)
+      removeChildById(chatListBox, id)
     }
     chatItems.length = 0
     chatItemIds = []
@@ -1307,9 +1320,9 @@ async function main() {
     
     // Remove old messages
     for (let i = 0; i < msgCount; i++) {
-      messagesScroll.remove(`msg-${i}`)
+      removeChildById(messagesScroll, `msg-${i}`)
     }
-    messagesScroll.remove("empty-msg")
+    removeChildById(messagesScroll, "empty-msg")
     msgCount = 0
     // Clear stored references
     msgBoxes = []
@@ -1427,10 +1440,10 @@ async function main() {
       }
       
       // Show author name for group messages
-      if (msg.author && !msg.fromMe) {
+      if (msg.authorName && !msg.fromMe) {
         const authorText = new TextRenderable(renderer, {
           id: `author-${msgCount}`,
-          content: msg.author,
+          content: msg.authorName,
           fg: colors.primary,
         })
         bubble.add(authorText)

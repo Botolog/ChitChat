@@ -1,10 +1,14 @@
 import pkg from "whatsapp-web.js"
 const { Client, LocalAuth } = pkg
-import qrcode from "qrcode-terminal"
 import { EventEmitter } from "events"
 import { existsSync } from "fs"
 import { Logger } from "../utils/logger"
 import { mediaCache } from "../utils/mediaCache"
+import { renderQrBlocks } from "../utils/qr"
+import type { ChatData, ContactData, MediaAttachment, MessageData } from "./types"
+import type { ServiceCapabilities } from "./capabilities"
+
+export type { ChatData, ContactData, MediaAttachment, MessageData }
 
 const logger = new Logger("whatsapp.log", "WhatsApp")
 
@@ -60,60 +64,6 @@ function buildPuppeteerOptions() {
     ],
     timeout: 120000,
   }
-}
-
-export interface ChatData {
-  id: string
-  name: string
-  isGroup: boolean
-  unreadCount: number
-  pinned: boolean
-  muted: boolean
-  archived: boolean
-  participantCount?: number
-  lastMessage?: {
-    body: string
-    timestamp: number
-    fromMe: boolean
-  }
-}
-
-export interface MediaAttachment {
-  type: 'image' | 'video' | 'audio' | 'document' | 'sticker'
-  mimetype: string
-  filename?: string
-  filesize?: number
-  data?: string // Base64 or file path after download
-  url?: string
-  thumbnail?: string // Base64 thumbnail
-}
-
-export interface MessageData {
-  id: string
-  body: string
-  timestamp: number
-  fromMe: boolean
-  author?: string
-  authorName?: string
-  hasMedia: boolean
-  type: string
-  ack?: number
-  isForwarded?: boolean
-  forwardingScore?: number
-  isStarred?: boolean
-  hasQuotedMsg?: boolean
-  quotedMsgBody?: string
-  quotedMsgId?: string
-  media?: MediaAttachment
-}
-
-export interface ContactData {
-  id: string
-  name: string
-  number: string
-  isMyContact: boolean
-  isGroup: boolean
-  isBlocked: boolean
 }
 
 class WhatsAppService extends EventEmitter {
@@ -353,11 +303,7 @@ class WhatsAppService extends EventEmitter {
    * showed up). The UI layer draws the returned string inside a modal.
    */
   renderQrCode(qr: string): string {
-    let rendered = ""
-    qrcode.generate(qr, { small: true }, (out: string) => {
-      rendered = out
-    })
-    return rendered
+    return renderQrBlocks(qr)
   }
 
   async getChats(): Promise<ChatData[]> {
@@ -733,8 +679,8 @@ class WhatsAppService extends EventEmitter {
         mimetype: msgAny.mimetype || 'application/octet-stream',
         filename: filename,
         filesize: msgAny.filesize || msgAny._data?.size,
-        // Store message ID and timestamp for cache lookup
-        data: message.id._serialized,
+        // Media bytes are fetched lazily from this message id.
+        messageId: message.id._serialized,
       }
       logger.debug("WhatsApp", "Message has media", { 
         type: mediaType, 
@@ -764,7 +710,7 @@ class WhatsAppService extends EventEmitter {
       body: message.body || "",
       timestamp: message.timestamp,
       fromMe: message.fromMe,
-      author: message.author,
+      authorName: message.author,
       hasMedia: message.hasMedia,
       type: message.type,
       ack: message.ack,

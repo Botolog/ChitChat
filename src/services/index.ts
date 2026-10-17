@@ -1,33 +1,18 @@
-import { EventEmitter } from "events"
 import { logger } from "../utils/logger"
-import type { ChatData, MessageData, ContactData } from "./whatsapp"
+import type { MessagingService } from "./types"
 
-// Re-export types
-export type { ChatData, MessageData, ContactData }
-
-// Unified service interface
-export interface MessagingService extends EventEmitter {
-  initialize(...args: any[]): Promise<void>
-  isReady(): boolean
-  getChats(): Promise<ChatData[]>
-  getMessages(chatId: string, limit?: number): Promise<MessageData[]>
-  sendMessage(chatId: string, content: string, options?: { replyTo?: string }): Promise<MessageData | null>
-  deleteMessage(messageId: string, chatId: string, forMe: boolean): Promise<boolean>
-  editMessage(messageId: string, chatId: string, newText: string): Promise<boolean>
-  markAsRead(chatId: string): Promise<void>
-  pinChat(chatId: string, pin: boolean): Promise<boolean>
-  muteChat(chatId: string, mute: boolean): Promise<boolean>
-  archiveChat(chatId: string, archive: boolean): Promise<boolean>
-  getContactInfo(contactId: string): Promise<ContactData | null>
-  destroy(): Promise<void>
-  getConnectionState(): { ready: boolean; hasQr: boolean }
-  /**
-   * Render a QR payload into a printable string (block characters) for the TUI
-   * to display itself. Implementations must NOT write to stdout: the TUI owns
-   * the terminal, so anything printed there is overwritten and never seen.
-   */
-  renderQrCode?(qr: string): string
-}
+// Re-export the shared contract for convenience.
+export type {
+  MessagingService,
+  ChatData,
+  MessageData,
+  ContactData,
+  MediaAttachment,
+  ConnectionState,
+  SendMessageOptions,
+  TypingPayload,
+} from "./types"
+export type { ServiceCapabilities } from "./capabilities"
 
 // Service instances cache
 const serviceInstances: Map<string, MessagingService> = new Map()
